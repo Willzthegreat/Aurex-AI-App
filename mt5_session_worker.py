@@ -163,7 +163,10 @@ def stop_worker(connection_id: str) -> bool:
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=4)
-        return process is None or process.poll() is not None
+        stopped = process is None or process.poll() is not None
+        if stopped:
+            shutil.rmtree(TERMINALS_DIR / connection_id, ignore_errors=True)
+        return stopped
 
 async def supervise() -> None:
     while True:
