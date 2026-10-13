@@ -1,10 +1,12 @@
 import asyncio
+import os
 from datetime import datetime, timezone
 
 import MetaTrader5 as mt5
 import pandas as pd
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 
 # ============================================================
@@ -12,6 +14,29 @@ from fastapi.middleware.cors import CORSMiddleware
 # ============================================================
 
 SYMBOL = "XAUUSDm"
+CONNECTOR_TOKEN = os.getenv("AUREX_CONNECTOR_SERVICE_TOKEN")
+
+if not CONNECTOR_TOKEN:
+    raise RuntimeError(
+        "AUREX_CONNECTOR_SERVICE_TOKEN must be set; refusing to start without bearer authentication."
+    )
+
+bearer = HTTPBearer(auto_error=False)
+
+
+def require_bearer(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
+):
+    if (
+        credentials is None
+        or credentials.scheme.lower() != "bearer"
+        or credentials.credentials != CONNECTOR_TOKEN
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Bearer token required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
 TIMEFRAMES = {
     "M1": mt5.TIMEFRAME_M1,
@@ -206,7 +231,7 @@ async def shutdown():
 # HEALTH CHECK
 # ============================================================
 
-@app.get("/health")
+@app.get("/health", dependencies=[Depends(require_bearer)])
 def health():
 
     terminal = mt5.terminal_info()
@@ -239,7 +264,7 @@ def health():
 # LIVE TICK
 # ============================================================
 
-@app.get("/api/tick/{symbol}")
+@app.get("/api/tick/{symbol}", dependencies=[Depends(require_bearer)])
 def tick(symbol: str):
 
     if symbol.upper() != SYMBOL.upper():
@@ -255,7 +280,7 @@ def tick(symbol: str):
 # HISTORICAL CANDLES
 # ============================================================
 
-@app.get("/api/candles/{symbol}/{timeframe}")
+@app.get("/api/candles/{symbol}/{timeframe}", dependencies=[Depends(require_bearer)])
 def candles(
     symbol: str,
     timeframe: str,
@@ -283,6 +308,22 @@ async def market_websocket(
     websocket: WebSocket,
     symbol: str,
 ):
+
+    authorization = websocket.headers.get("authorization", "")
+    scheme, _, token = authorization.partition(" ")
+    # Browser WebSocket clients cannot set an Authorization header. Support
+    # the standard subprotocol form (`bearer, <token>`) and a query-token
+    # fallback for legacy clients, while keeping the endpoint fail-closed.
+    protocols = [item.strip() for item in websocket.headers.get("sec-websocket-protocol", "").split(",")]
+    query_token = websocket.query_params.get("access_token")
+    authenticated = (
+        (scheme.lower() == "bearer" and token == CONNECTOR_TOKEN)
+        or CONNECTOR_TOKEN in protocols
+        or query_token == CONNECTOR_TOKEN
+    )
+    if not authenticated:
+        await websocket.close(code=1008, reason="Bearer token required")
+        return
 
     await websocket.accept()
 
