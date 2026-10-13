@@ -1,14 +1,29 @@
 import asyncio
+<<<<<<< HEAD
 import os
+=======
+import hmac
+import os
+import re
+>>>>>>> origin/main
 from datetime import datetime, timezone
+from typing import Annotated
 
 import MetaTrader5 as mt5
 import pandas as pd
+<<<<<<< HEAD
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+=======
+from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
+>>>>>>> origin/main
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+# This bridge intentionally serves authenticated market data only.
+# Do not add order execution here until each customer has a separately
+# isolated MT5 terminal/account route and server-side authorization.
 
+<<<<<<< HEAD
 # ============================================================
 # CONFIGURATION
 # ============================================================
@@ -37,6 +52,10 @@ def require_bearer(
             detail="Bearer token required",
             headers={"WWW-Authenticate": "Bearer"},
         )
+=======
+DEFAULT_SYMBOL = os.getenv("MT5_DEFAULT_SYMBOL", "XAUUSDm")
+SYMBOL_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
+>>>>>>> origin/main
 
 TIMEFRAMES = {
     "M1": mt5.TIMEFRAME_M1,
@@ -50,144 +69,74 @@ TIMEFRAMES = {
     "MN1": mt5.TIMEFRAME_MN1,
 }
 
+app = FastAPI(title="Aurex Authenticated MT5 Market Data Bridge", version="1.1.0")
 
-# ============================================================
-# FASTAPI
-# ============================================================
-
-app = FastAPI(
-    title="Exness MT5 Market Data Service",
-    version="1.0.0",
-)
-
-from fastapi.middleware.cors import CORSMiddleware
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["https://floot.com"],
-    allow_credentials=False,
-    allow_methods=["GET"],
-    allow_headers=["*"],
-)
+# The Floot backend calls this service server-to-server. Browser CORS access
+# is deliberately not enabled; never expose the bridge API key in frontend code.
 
 
+def verify_bridge_key(
+    x_aurex_bridge_key: Annotated[str | None, Header(alias="X-Aurex-Bridge-Key")] = None,
+):
+    expected = os.getenv("AUREX_BRIDGE_API_KEY", "").strip()
+    if not expected:
+        raise HTTPException(status_code=503, detail="Bridge authentication is not configured.")
+    if not x_aurex_bridge_key or not hmac.compare_digest(x_aurex_bridge_key, expected):
+        raise HTTPException(status_code=401, detail="Invalid bridge credentials.")
+    return True
 
-# Development CORS.
-# We will restrict this later when connecting production.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
+def validate_symbol(symbol: str) -> str:
+    if not SYMBOL_PATTERN.fullmatch(symbol):
+        raise HTTPException(status_code=400, detail="Invalid symbol.")
+    if not mt5.symbol_select(symbol, True):
+        raise HTTPException(status_code=404, detail=f"Symbol {symbol} is unavailable in the connected MT5 terminal.")
+    info = mt5.symbol_info(symbol)
+    if info is None:
+        raise HTTPException(status_code=404, detail=f"Symbol {symbol} was not found.")
+    return symbol
 
-# ============================================================
-# MT5 CONNECTION
-# ============================================================
 
 def connect_mt5():
-    """
-    Connect to the already-installed MT5 EXNESS terminal.
-    """
-
     if not mt5.initialize():
-        raise RuntimeError(
-            f"MT5 initialization failed: {mt5.last_error()}"
-        )
-
+        raise RuntimeError(f"MT5 initialization failed: {mt5.last_error()}")
     terminal = mt5.terminal_info()
-
-    if terminal is None:
-        raise RuntimeError(
-            f"MT5 terminal information unavailable: {mt5.last_error()}"
-        )
-
-    if not terminal.connected:
+    if terminal is None or not terminal.connected:
         raise RuntimeError("MT5 terminal is not connected.")
-
-    # Make sure our symbol is available.
-    if not mt5.symbol_select(SYMBOL, True):
-        raise RuntimeError(
-            f"Could not select {SYMBOL}: {mt5.last_error()}"
-        )
-
-    print("======================================")
-    print("MT5 DATA SERVICE")
-    print("======================================")
-    print("Broker:", terminal.company)
-    print("Terminal:", terminal.name)
-    print("Symbol:", SYMBOL)
-    print("Connected:", terminal.connected)
-    print("======================================")
+    validate_symbol(DEFAULT_SYMBOL)
+    print("Aurex MT5 bridge connected:", terminal.company, terminal.name, DEFAULT_SYMBOL)
 
 
-# ============================================================
-# HELPERS
-# ============================================================
-
-def get_tick():
-    tick = mt5.symbol_info_tick(SYMBOL)
-
+def get_tick(symbol: str):
+    validate_symbol(symbol)
+    tick = mt5.symbol_info_tick(symbol)
     if tick is None:
-        raise HTTPException(
-            status_code=503,
-            detail=f"No tick data available for {SYMBOL}"
-        )
-
+        raise HTTPException(status_code=503, detail=f"No tick data available for {symbol}.")
     return {
-        "symbol": SYMBOL,
+        "symbol": symbol,
         "bid": tick.bid,
         "ask": tick.ask,
-        "spread": round(tick.ask - tick.bid, 5),
+        "spread": round(tick.ask - tick.bid, 8),
         "last": tick.last,
         "volume": tick.volume,
-        "time": datetime.fromtimestamp(
-            tick.time,
-            tz=timezone.utc
-        ).isoformat(),
+        "time": datetime.fromtimestamp(tick.time, tz=timezone.utc).isoformat(),
         "time_msc": tick.time_msc,
     }
 
 
-def get_candles(timeframe_name: str, count: int = 200):
-
+def get_candles(symbol: str, timeframe_name: str, count: int = 200):
+    validate_symbol(symbol)
     timeframe = TIMEFRAMES.get(timeframe_name.upper())
-
     if timeframe is None:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported timeframe: {timeframe_name}"
-        )
-
-    count = max(1, min(count, 5000))
-
-    rates = mt5.copy_rates_from_pos(
-        SYMBOL,
-        timeframe,
-        0,
-        count
-    )
-
+        raise HTTPException(status_code=400, detail=f"Unsupported timeframe: {timeframe_name}")
+    count = max(1, min(int(count), 3000))
+    rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, count)
     if rates is None or len(rates) == 0:
-        raise HTTPException(
-            status_code=503,
-            detail=f"No candle data available: {mt5.last_error()}"
-        )
-
+        raise HTTPException(status_code=503, detail=f"No candle data available: {mt5.last_error()}")
     df = pd.DataFrame(rates)
-
-    df["time"] = pd.to_datetime(
-        df["time"],
-        unit="s",
-        utc=True
-    )
-
+    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
     candles = []
-
     for _, row in df.iterrows():
-
         candles.append({
             "time": row["time"].isoformat(),
             "open": float(row["open"]),
@@ -198,68 +147,43 @@ def get_candles(timeframe_name: str, count: int = 200):
             "spread": int(row["spread"]),
             "real_volume": int(row["real_volume"]),
         })
+    return {"symbol": symbol, "timeframe": timeframe_name.upper(), "count": len(candles), "candles": candles}
 
-    return {
-        "symbol": SYMBOL,
-        "timeframe": timeframe_name.upper(),
-        "count": len(candles),
-        "candles": candles,
-    }
-
-
-# ============================================================
-# STARTUP / SHUTDOWN
-# ============================================================
 
 @app.on_event("startup")
 async def startup():
-
     connect_mt5()
-
-    print("MT5 service started successfully.")
 
 
 @app.on_event("shutdown")
 async def shutdown():
-
     mt5.shutdown()
 
-    print("MT5 connection closed.")
 
-
-# ============================================================
-# HEALTH CHECK
-# ============================================================
-
+<<<<<<< HEAD
 @app.get("/health", dependencies=[Depends(require_bearer)])
 def health():
 
+=======
+@app.get("/health")
+def health(_: bool = Depends(verify_bridge_key)):
+>>>>>>> origin/main
     terminal = mt5.terminal_info()
-
     if terminal is None:
-        return {
-            "status": "disconnected",
-            "mt5": False,
-        }
-
-    tick = mt5.symbol_info_tick(SYMBOL)
-
+        return {"status": "disconnected", "mt5": False}
+    tick = mt5.symbol_info_tick(DEFAULT_SYMBOL)
     return {
         "status": "ok" if terminal.connected else "disconnected",
-        "mt5": terminal.connected,
+        "mt5": bool(terminal.connected),
         "broker": terminal.company,
-        "symbol": SYMBOL,
+        "symbol": DEFAULT_SYMBOL,
         "has_tick": tick is not None,
-        "server_ping_ms": round(
-            terminal.ping_last / 1000,
-            2
-        ),
-        "checked_at": datetime.now(
-            timezone.utc
-        ).isoformat(),
+        "server_ping_ms": round(terminal.ping_last / 1000, 2),
+        "checked_at": datetime.now(timezone.utc).isoformat(),
     }
 
 
+<<<<<<< HEAD
 # ============================================================
 # LIVE TICK
 # ============================================================
@@ -274,36 +198,53 @@ def tick(symbol: str):
         )
 
     return get_tick()
+=======
+@app.get("/api/tick/{symbol}")
+def tick(symbol: str, _: bool = Depends(verify_bridge_key)):
+    return get_tick(symbol)
+>>>>>>> origin/main
 
 
-# ============================================================
-# HISTORICAL CANDLES
-# ============================================================
+@app.get("/api/symbol/{symbol}")
+def symbol_info(symbol: str, _: bool = Depends(verify_bridge_key)):
+    validate_symbol(symbol)
+    info = mt5.symbol_info(symbol)
+    tick = mt5.symbol_info_tick(symbol)
+    if info is None:
+        raise HTTPException(status_code=404, detail="Symbol specifications are unavailable.")
+    return {
+        "symbol": symbol,
+        "bid": tick.bid if tick else None,
+        "ask": tick.ask if tick else None,
+        "spread": (tick.ask - tick.bid) if tick else None,
+        "point": info.point,
+        "digits": info.digits,
+        "tick_size": info.trade_tick_size,
+        "tick_value": info.trade_tick_value,
+        "volume_min": info.volume_min,
+        "volume_max": info.volume_max,
+        "volume_step": info.volume_step,
+        "trade_contract_size": info.trade_contract_size,
+        "trade_mode": info.trade_mode,
+    }
 
+
+<<<<<<< HEAD
 @app.get("/api/candles/{symbol}/{timeframe}", dependencies=[Depends(require_bearer)])
 def candles(
     symbol: str,
     timeframe: str,
     count: int = 200,
 ):
+=======
+@app.get("/api/candles/{symbol}/{timeframe}")
+def candles(symbol: str, timeframe: str, count: int = 200, _: bool = Depends(verify_bridge_key)):
+    return get_candles(symbol, timeframe, count)
+>>>>>>> origin/main
 
-    if symbol.upper() != SYMBOL.upper():
-        raise HTTPException(
-            status_code=404,
-            detail=f"Only {SYMBOL} is enabled currently."
-        )
-
-    return get_candles(
-        timeframe,
-        count
-    )
-
-
-# ============================================================
-# WEBSOCKET LIVE MARKET DATA
-# ============================================================
 
 @app.websocket("/ws/market/{symbol}")
+<<<<<<< HEAD
 async def market_websocket(
     websocket: WebSocket,
     symbol: str,
@@ -335,54 +276,43 @@ async def market_websocket(
         })
 
         await websocket.close()
+=======
+async def market_websocket(websocket: WebSocket, symbol: str):
+    # Browser WebSocket clients cannot set arbitrary headers. Keep this route
+    # for trusted non-browser clients only; the web app uses the authenticated
+    # same-origin Floot HTTP proxy instead.
+    expected = os.getenv("AUREX_BRIDGE_API_KEY", "").strip()
+    supplied = websocket.headers.get("x-aurex-bridge-key", "")
+    if not expected or not supplied or not hmac.compare_digest(supplied, expected):
+        await websocket.close(code=4401, reason="Bridge authentication required")
+>>>>>>> origin/main
         return
-
-    print(f"WebSocket connected: {symbol}")
-
-    last_time_msc = None
-
     try:
-
+        validate_symbol(symbol)
+    except HTTPException:
+        await websocket.close(code=4404, reason="Symbol unavailable")
+        return
+    await websocket.accept()
+    last_time_msc = None
+    try:
         while True:
-
-            tick = mt5.symbol_info_tick(SYMBOL)
-
-            if tick is not None:
-
-                if tick.time_msc != last_time_msc:
-
-                    last_time_msc = tick.time_msc
-
-                    await websocket.send_json({
-                        "type": "tick",
-                        "symbol": SYMBOL,
-                        "bid": tick.bid,
-                        "ask": tick.ask,
-                        "spread": round(
-                            tick.ask - tick.bid,
-                            5
-                        ),
-                        "time": datetime.fromtimestamp(
-                            tick.time,
-                            tz=timezone.utc
-                        ).isoformat(),
-                        "time_msc": tick.time_msc,
-                    })
-
+            tick = mt5.symbol_info_tick(symbol)
+            if tick is not None and tick.time_msc != last_time_msc:
+                last_time_msc = tick.time_msc
+                await websocket.send_json({
+                    "type": "tick",
+                    "symbol": symbol,
+                    "bid": tick.bid,
+                    "ask": tick.ask,
+                    "spread": round(tick.ask - tick.bid, 8),
+                    "time": datetime.fromtimestamp(tick.time, tz=timezone.utc).isoformat(),
+                    "time_msc": tick.time_msc,
+                })
             await asyncio.sleep(0.25)
-
     except WebSocketDisconnect:
-
-        print(f"WebSocket disconnected: {symbol}")
-
-    except Exception as error:
-
-        print(
-            f"WebSocket error for {symbol}:",
-            error
-        )
-
+        pass
+    except Exception:
         try:
-            await websocket.close()
+            await websocket.close(code=1011)
         except Exception:
             pass
