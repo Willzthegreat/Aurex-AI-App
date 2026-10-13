@@ -296,7 +296,8 @@ def connection_tick(connection_id: str, symbol: str, _: bool = Depends(verify_se
     port = int(record["local_port"])
     import urllib.request
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/internal/tick/{symbol}", timeout=3) as response:
+        request = urllib.request.Request(f"http://127.0.0.1:{port}/internal/tick/{symbol}", headers={"X-Aurex-Internal-Key": INTERNAL_KEY})
+        with urllib.request.urlopen(request, timeout=3) as response:
             return json.loads(response.read().decode("utf-8"))
     except Exception:
         raise HTTPException(status_code=503, detail="Unable to read tick from the isolated terminal session.")
@@ -313,7 +314,8 @@ def connection_candles(connection_id: str, symbol: str, timeframe: str, count: i
     import urllib.request
     try:
         url = f"http://127.0.0.1:{port}/internal/candles/{symbol}/{timeframe}?count={max(1, min(int(count), 3000))}"
-        with urllib.request.urlopen(url, timeout=8) as response:
+        request = urllib.request.Request(url, headers={"X-Aurex-Internal-Key": INTERNAL_KEY})
+        with urllib.request.urlopen(request, timeout=8) as response:
             return json.loads(response.read().decode("utf-8"))
     except Exception:
         raise HTTPException(status_code=503, detail="Unable to read candles from the isolated terminal session.")
