@@ -1,61 +1,20 @@
 import asyncio
-<<<<<<< HEAD
-import os
-=======
 import hmac
 import os
 import re
->>>>>>> origin/main
 from datetime import datetime, timezone
 from typing import Annotated
 
 import MetaTrader5 as mt5
 import pandas as pd
-<<<<<<< HEAD
-from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-=======
 from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
->>>>>>> origin/main
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 # This bridge intentionally serves authenticated market data only.
 # Do not add order execution here until each customer has a separately
 # isolated MT5 terminal/account route and server-side authorization.
 
-<<<<<<< HEAD
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-SYMBOL = "XAUUSDm"
-CONNECTOR_TOKEN = os.getenv("AUREX_CONNECTOR_SERVICE_TOKEN")
-
-if not CONNECTOR_TOKEN:
-    raise RuntimeError(
-        "AUREX_CONNECTOR_SERVICE_TOKEN must be set; refusing to start without bearer authentication."
-    )
-
-bearer = HTTPBearer(auto_error=False)
-
-
-def require_bearer(
-    credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
-):
-    if (
-        credentials is None
-        or credentials.scheme.lower() != "bearer"
-        or credentials.credentials != CONNECTOR_TOKEN
-    ):
-        raise HTTPException(
-            status_code=401,
-            detail="Bearer token required",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-=======
 DEFAULT_SYMBOL = os.getenv("MT5_DEFAULT_SYMBOL", "XAUUSDm")
 SYMBOL_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
->>>>>>> origin/main
 
 TIMEFRAMES = {
     "M1": mt5.TIMEFRAME_M1,
@@ -160,14 +119,8 @@ async def shutdown():
     mt5.shutdown()
 
 
-<<<<<<< HEAD
-@app.get("/health", dependencies=[Depends(require_bearer)])
-def health():
-
-=======
 @app.get("/health")
 def health(_: bool = Depends(verify_bridge_key)):
->>>>>>> origin/main
     terminal = mt5.terminal_info()
     if terminal is None:
         return {"status": "disconnected", "mt5": False}
@@ -183,26 +136,9 @@ def health(_: bool = Depends(verify_bridge_key)):
     }
 
 
-<<<<<<< HEAD
-# ============================================================
-# LIVE TICK
-# ============================================================
-
-@app.get("/api/tick/{symbol}", dependencies=[Depends(require_bearer)])
-def tick(symbol: str):
-
-    if symbol.upper() != SYMBOL.upper():
-        raise HTTPException(
-            status_code=404,
-            detail=f"Only {SYMBOL} is enabled currently."
-        )
-
-    return get_tick()
-=======
 @app.get("/api/tick/{symbol}")
 def tick(symbol: str, _: bool = Depends(verify_bridge_key)):
     return get_tick(symbol)
->>>>>>> origin/main
 
 
 @app.get("/api/symbol/{symbol}")
@@ -229,54 +165,12 @@ def symbol_info(symbol: str, _: bool = Depends(verify_bridge_key)):
     }
 
 
-<<<<<<< HEAD
-@app.get("/api/candles/{symbol}/{timeframe}", dependencies=[Depends(require_bearer)])
-def candles(
-    symbol: str,
-    timeframe: str,
-    count: int = 200,
-):
-=======
 @app.get("/api/candles/{symbol}/{timeframe}")
 def candles(symbol: str, timeframe: str, count: int = 200, _: bool = Depends(verify_bridge_key)):
     return get_candles(symbol, timeframe, count)
->>>>>>> origin/main
 
 
 @app.websocket("/ws/market/{symbol}")
-<<<<<<< HEAD
-async def market_websocket(
-    websocket: WebSocket,
-    symbol: str,
-):
-
-    authorization = websocket.headers.get("authorization", "")
-    scheme, _, token = authorization.partition(" ")
-    # Browser WebSocket clients cannot set an Authorization header. Support
-    # the standard subprotocol form (`bearer, <token>`) and a query-token
-    # fallback for legacy clients, while keeping the endpoint fail-closed.
-    protocols = [item.strip() for item in websocket.headers.get("sec-websocket-protocol", "").split(",")]
-    query_token = websocket.query_params.get("access_token")
-    authenticated = (
-        (scheme.lower() == "bearer" and token == CONNECTOR_TOKEN)
-        or CONNECTOR_TOKEN in protocols
-        or query_token == CONNECTOR_TOKEN
-    )
-    if not authenticated:
-        await websocket.close(code=1008, reason="Bearer token required")
-        return
-
-    await websocket.accept()
-
-    if symbol.upper() != SYMBOL.upper():
-
-        await websocket.send_json({
-            "type": "error",
-            "message": f"Only {SYMBOL} is enabled."
-        })
-
-        await websocket.close()
-=======
 async def market_websocket(websocket: WebSocket, symbol: str):
     # Browser WebSocket clients cannot set arbitrary headers. Keep this route
     # for trusted non-browser clients only; the web app uses the authenticated
@@ -285,7 +179,6 @@ async def market_websocket(websocket: WebSocket, symbol: str):
     supplied = websocket.headers.get("x-aurex-bridge-key", "")
     if not expected or not supplied or not hmac.compare_digest(supplied, expected):
         await websocket.close(code=4401, reason="Bridge authentication required")
->>>>>>> origin/main
         return
     try:
         validate_symbol(symbol)
