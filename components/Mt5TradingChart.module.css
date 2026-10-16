@@ -1,0 +1,4 @@
+.chart { width: 100%; min-height: 260px; background: #101827; border-radius: 8px; }
+.chartToolbar { display: flex; justify-content: space-between; gap: 16px; margin-bottom: 8px; color: #cbd5e1; font: 14px system-ui, sans-serif; }
+.chartState { padding: 32px; color: #cbd5e1; background: #101827; border-radius: 8px; font: 14px system-ui, sans-serif; }
+.chartError { color: #fca5a5; }

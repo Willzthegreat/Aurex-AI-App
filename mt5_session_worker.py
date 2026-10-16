@@ -24,7 +24,7 @@ from typing import Any
 from uuid import UUID
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 import uvicorn
 
@@ -290,6 +290,9 @@ def revoke_connection(connection_id: str, _: bool = Depends(verify_service_token
 
 @app.get("/v1/connections/{connection_id}/tick/{symbol}")
 def connection_tick(connection_id: str, symbol: str, _: bool = Depends(verify_service_token)):
+    import re
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,32}", symbol):
+        raise HTTPException(status_code=422, detail="Invalid symbol.")
     record = read_record(connection_id)
     if record.get("revoked"):
         raise HTTPException(status_code=410, detail="Connection has been revoked.")
@@ -306,7 +309,12 @@ def connection_tick(connection_id: str, symbol: str, _: bool = Depends(verify_se
         raise HTTPException(status_code=503, detail="Unable to read tick from the isolated terminal session.")
 
 @app.get("/v1/connections/{connection_id}/candles/{symbol}/{timeframe}")
-def connection_candles(connection_id: str, symbol: str, timeframe: str, count: int = 200, _: bool = Depends(verify_service_token)):
+def connection_candles(connection_id: str, symbol: str, timeframe: str, count: int = Query(200, ge=1, le=3000), _: bool = Depends(verify_service_token)):
+    import re
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,32}", symbol):
+        raise HTTPException(status_code=422, detail="Invalid symbol.")
+    if timeframe.upper() not in {"M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1", "MN1"}:
+        raise HTTPException(status_code=422, detail="Unsupported timeframe.")
     record = read_record(connection_id)
     if record.get("revoked"):
         raise HTTPException(status_code=410, detail="Connection has been revoked.")

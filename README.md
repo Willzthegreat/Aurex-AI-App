@@ -88,6 +88,23 @@ After the worker is deployed behind HTTPS, connect these server-side Floot varia
 
 All connector endpoints require `Authorization: Bearer <AUREX_CONNECTOR_SERVICE_TOKEN>`. Child-process data endpoints are loopback-only and protected by `AUREX_WORKER_INTERNAL_KEY`.
 
+### Aurex application API in this repository
+
+`aurex_backend.py` provides the customer-facing FastAPI routes under `/api/mt5`. Mount it behind the existing Aurex authentication middleware so that middleware sets `request.state.aurex_user_id`; a browser-provided user ID is never accepted. It stores only connection ownership and non-secret metadata in `AUREX_CONNECTION_DB` (default `./aurex-connections.sqlite3`) and sends broker credentials directly to the managed connector, which encrypts them at rest.
+
+Customer routes are:
+
+- `GET /api/mt5/connections`
+- `POST /api/mt5/connections`
+- `GET /api/mt5/connections/{connection_id}`
+- `GET /api/mt5/connections/{connection_id}/tick/{symbol}`
+- `GET /api/mt5/connections/{connection_id}/candles/{symbol}/{timeframe}?count=200`
+- `DELETE /api/mt5/connections/{connection_id}`
+
+Set `AUREX_CONNECTOR_SERVICE_URL` and `AUREX_CONNECTOR_SERVICE_TOKEN` only in the Aurex server environment. No route in this module calls port `8000`.
+
+For the included session adapter, set `AUREX_AUTH_SESSION_SECRET` to a separate random secret and add `AurexSessionMiddleware` to the host app. The existing Aurex login handler must call `set_session_cookie(response, authenticated_user.id)` after it verifies the user. The MT5 routes then receive the verified identity through `request.state.aurex_user_id`; they do not accept a user ID from JSON or browser headers. See `aurex_auth.py` and `aurex.env.example`.
+
 ### Exness API adapter
 
 The app keeps an adapter slot for an official broker API, but it does not fabricate Exness endpoints or accept Exness API secrets until account/region eligibility and the official API protocol are verified. The initial active integration path is isolated MT5 terminal sessions. API access varies by region and account eligibility; check the official Exness documentation before enabling the adapter.
