@@ -1,0 +1,42 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&family=Instrument+Serif:ital@0;1&display=swap');
+:root {
+  /* Overlay layers */
+  --z-overlay: 400;
+  --z-spotlight: 1000;
+  /* System layers */
+  --z-critical: 2000;
+  /* spacing */
+  --spacing-1: 0.25rem;
+  --spacing-2: 0.5rem;
+  --spacing-3: 0.75rem;
+  --spacing-4: 1rem;
+  --spacing-6: 1.5rem;
+  --spacing-8: 2rem;
+  --spacing-12: 3rem;
+  --spacing-16: 4rem;
+  --spacing-20: 5rem;
+}
+:root {
+  --background:#f3f6f5; --foreground:#17211f; --surface:#e8eeec; --surface-foreground:#17211f;
+  --sidebar:#e2e9e6; --sidebar-foreground:#17211f; --card:#fbfcfc; --card-foreground:#17211f;
+  --popup:#fff; --popup-foreground:#17211f; --primary:#087e68; --primary-foreground:#f5fffc;
+  --secondary:#dce6e2; --secondary-foreground:#263632; --accent:#d3f5e9; --accent-foreground:#075d4c;
+  --muted:#e7edeb; --muted-foreground:#667570; --success:#0c9b72; --success-foreground:#fff;
+  --error:#d64d5c; --error-foreground:#fff; --warning:#c58a2a; --warning-foreground:#fff;
+  --info:#347cb5; --info-hover:#28699d; --info-active:#205985; --info-foreground:#fff; --border:#d1dbd7;
+  --font-family-base:'IBM Plex Sans',sans-serif; --font-family-display:'Instrument Serif',serif; --font-family-monospace:'DM Mono',monospace; --font-family-cursive:'Instrument Serif',serif;
+  --shadow:0 1px 2px rgba(10,30,24,.05); --shadow-md:0 8px 24px rgba(10,30,24,.08); --shadow-lg:0 18px 50px rgba(10,30,24,.12); --shadow-focus:0 0 0 3px rgba(8,126,104,.2);
+  --radius-sm:4px; --radius:6px; --radius-md:9px; --radius-lg:14px; --radius-full:999px;
+  --animation-duration-fast:120ms; --animation-duration-normal:180ms; --animation-duration-slow:280ms;
+  --chart-color-1:#18c79a; --chart-color-2:#e15c69; --chart-color-3:#e9b45e; --chart-color-4:#6b9df2; --chart-color-5:#a68be8;
+}
+.dark {
+  --background:#0a1114; --foreground:#e4eeeb; --surface:#111b1f; --surface-foreground:#e4eeeb;
+  --sidebar:#0c1518; --sidebar-foreground:#dce8e4; --card:#111b1f; --card-foreground:#e4eeeb;
+  --popup:#172327; --popup-foreground:#e4eeeb; --primary:#27d6a5; --primary-foreground:#06251d;
+  --secondary:#1b292d; --secondary-foreground:#cbd8d4; --accent:#173d34; --accent-foreground:#7ef0ca;
+  --muted:#172327; --muted-foreground:#8a9b96; --success:#28d6a3; --success-foreground:#06251d;
+  --error:#ff6d79; --error-foreground:#300c12; --warning:#f2b95f; --warning-foreground:#2b1b04;
+  --info:#76b5ff; --info-hover:#91c4ff; --info-active:#b1d5ff; --info-foreground:#071d32; --border:#263639;
+  --shadow:0 1px 2px rgba(0,0,0,.2); --shadow-md:0 8px 24px rgba(0,0,0,.24); --shadow-lg:0 18px 50px rgba(0,0,0,.32); --shadow-focus:0 0 0 3px rgba(39,214,165,.22);
+}

@@ -1,11 +1,18 @@
 import json
+import os
 import shutil
+import subprocess
+import sys
+import urllib.error
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
-from aurex_backend import ConnectionStore, create_app
+os.environ.setdefault("AUREX_CONNECTOR_SERVICE_URL", "http://127.0.0.1:8010")
+os.environ.setdefault("AUREX_CONNECTOR_SERVICE_TOKEN", "offline-test-token")
+
+from aurex_backend import ConnectorError, ConnectionStore, create_app, validate_connector_url
 
 
 class FakeConnector:
@@ -97,3 +104,98 @@ def test_invalid_chart_parameters_are_rejected(client):
     headers = {"x-test-user": "alice"}
     assert client.get(f"/api/mt5/connections/{cid}/tick/XAU%20USD", headers=headers).status_code == 422
     assert client.get(f"/api/mt5/connections/{cid}/candles/XAUUSDm/H2", headers=headers).status_code == 422
+
+
+@pytest.mark.parametrize("url", [
+    "http://127.0.0.1:8010",
+    "http://localhost:8010",
+    "http://[::1]:8010",
+    "https://connector.example.com",
+])
+def test_connector_url_policy_allows_loopback_http_and_remote_https(url):
+    assert validate_connector_url(url).startswith(("http://", "https://"))
+
+
+@pytest.mark.parametrize("url", [
+    "http://connector.example.com",
+    "ftp://connector.example.com",
+    "https://user:password@connector.example.com",
+    "https://connector.example.com/path",
+    "https://connector.example.com:bad",
+    "not a URL",
+])
+def test_connector_url_policy_rejects_unsafe_or_malformed_urls(url):
+    with pytest.raises(ConnectorError):
+        validate_connector_url(url)
+
+
+@pytest.mark.parametrize("url", [
+    "https://bad%20host.example.com",
+    "https://bad label.example.com",
+    "https://exa_mple.example.com",
+    "http://192.168.1.10:8010",
+    "https://127.0.0.1%3A8010",
+])
+def test_connector_url_rejects_ambiguous_authorities_and_remote_http(url):
+    with pytest.raises(ConnectorError):
+        validate_connector_url(url)
+
+
+def test_connector_url_normalizes_valid_idna_and_literal_ipv6():
+    assert validate_connector_url("https://BÜCHER.example.com") == "https://xn--bcher-kva.example.com"
+    assert validate_connector_url("http://[::1]:8010") == "http://[::1]:8010"
+
+
+def test_connector_redirect_handler_rejects_redirects_before_following():
+    from aurex_backend import _NoRedirectHandler
+
+    with pytest.raises(urllib.error.URLError):
+        _NoRedirectHandler().redirect_request(None, None, 302, "Found", {}, "https://evil.example")
+
+
+@pytest.mark.parametrize("url", [
+    "http://connector.example.com",
+    "https://connector.example.com/path",
+    "https://bad%20host.example.com",
+    "https://user:password@connector.example.com",
+])
+def test_app_construction_rejects_invalid_connector_configuration(url, monkeypatch):
+    monkeypatch.setenv("AUREX_CONNECTOR_SERVICE_URL", url)
+    monkeypatch.setenv("AUREX_CONNECTOR_SERVICE_TOKEN", "offline-test-token")
+    with pytest.raises(RuntimeError, match="Managed connector|Remote"):
+        create_app(ConnectionStore(":memory:"), client_factory=lambda: FakeConnector())
+
+
+def test_app_construction_rejects_missing_connector_token(monkeypatch):
+    monkeypatch.setenv("AUREX_CONNECTOR_SERVICE_URL", "http://127.0.0.1:8010")
+    monkeypatch.delenv("AUREX_CONNECTOR_SERVICE_TOKEN", raising=False)
+    with pytest.raises(RuntimeError, match="AUREX_CONNECTOR_SERVICE_TOKEN"):
+        create_app(ConnectionStore(":memory:"), client_factory=lambda: FakeConnector())
+
+
+def test_helper_import_works_without_connector_secrets():
+    environment = os.environ.copy()
+    environment.pop("AUREX_CONNECTOR_SERVICE_URL", None)
+    environment.pop("AUREX_CONNECTOR_SERVICE_TOKEN", None)
+    result = subprocess.run(
+        [sys.executable, "-c", "from aurex_backend import validate_connector_url; print(validate_connector_url('https://connector.example.com'))"],
+        cwd=Path.cwd(), env=environment, capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0
+    assert result.stdout.strip() == "https://connector.example.com"
+
+
+def test_production_app_construction_rejects_missing_connector_url_and_token(monkeypatch):
+    monkeypatch.setenv("AUREX_ENV", "production")
+    monkeypatch.setenv("AUREX_AUTH_COOKIE_SECURE", "true")
+    monkeypatch.setenv("AUREX_TRUSTED_ORIGINS", "https://terminal.example.com")
+    monkeypatch.delenv("AUREX_CONNECTOR_SERVICE_URL", raising=False)
+    monkeypatch.delenv("AUREX_CONNECTOR_SERVICE_TOKEN", raising=False)
+    with pytest.raises(RuntimeError, match="AUREX_CONNECTOR_SERVICE_URL"):
+        create_app(ConnectionStore(":memory:"), client_factory=lambda: FakeConnector())
+
+
+def test_connection_store_configures_busy_timeout(client):
+    store = ConnectionStore(str(Path.cwd() / ".aurex-test-db" / "busy.sqlite3"))
+    with store._db() as db:
+        assert db.execute("PRAGMA busy_timeout").fetchone()[0] == 5000

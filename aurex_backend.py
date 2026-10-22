@@ -8,6 +8,7 @@ It deliberately has no dependency on the legacy port 8000 bridge.
 from __future__ import annotations
 
 import json
+import ipaddress
 import math
 import os
 import re
@@ -19,11 +20,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 from uuid import UUID, uuid4
+from urllib.parse import urlsplit
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, Field, field_validator
 
-from aurex_auth import AurexSessionMiddleware
+from aurex_auth import (AuthStore, AurexSessionMiddleware, client_key, clear_session_cookie,
+                        normalize_email, public_user, require_user, set_session_cookie,
+                        validate_password, verify_password)
 
 SYMBOL_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
 TIMEFRAMES = {"M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1", "MN1"}
@@ -47,6 +51,15 @@ class ConnectionInput(BaseModel):
         return value
 
 
+class AuthInput(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    password: str = Field(min_length=1, max_length=256)
+
+
+class RegisterInput(AuthInput):
+    confirm_password: str = Field(min_length=1, max_length=256)
+
+
 class ConnectionStore:
     def __init__(self, path: str | None = None):
         self.path = path or os.getenv("AUREX_CONNECTION_DB", "./aurex-connections.sqlite3")
@@ -62,8 +75,9 @@ class ConnectionStore:
             )""")
 
     def _db(self):
-        db = sqlite3.connect(self.path)
+        db = sqlite3.connect(self.path, timeout=5)
         db.row_factory = sqlite3.Row
+        db.execute("PRAGMA busy_timeout=5000")
         return db
 
     def create(self, user_id: str, body: ConnectionInput, connection_id: str) -> dict[str, Any]:
@@ -108,11 +122,69 @@ class ConnectorError(Exception):
         self.http_status, self.message = http_status, message
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.URLError("Connector redirects are not permitted")
+
+
+def validate_connector_url(value: str) -> str:
+    """Validate the connector origin before any bearer token is used."""
+    if not isinstance(value, str) or not value.strip():
+        raise ConnectorError(503, "Managed connector URL is not configured")
+    raw = value.strip()
+    try:
+        parsed = urlsplit(raw)
+        hostname = parsed.hostname
+        _ = parsed.port
+    except ValueError as exc:
+        raise ConnectorError(503, "Managed connector URL is invalid") from exc
+    if any(ord(char) < 32 or ord(char) == 127 for char in parsed.netloc) or "%" in parsed.netloc:
+        raise ConnectorError(503, "Managed connector URL is invalid")
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+    ):
+        raise ConnectorError(503, "Managed connector URL is invalid")
+    hostname = hostname.rstrip(".").casefold()
+    try:
+        ascii_hostname = hostname.encode("idna").decode("ascii").casefold()
+    except UnicodeError as exc:
+        raise ConnectorError(503, "Managed connector URL is invalid") from exc
+    if not ascii_hostname or any(not label or len(label) > 63 or label.startswith("-") or label.endswith("-")
+                                or not re.fullmatch(r"[a-z0-9-]+", label)
+                                for label in ascii_hostname.split(".")):
+        try:
+            ipaddress.ip_address(ascii_hostname)
+        except ValueError as exc:
+            raise ConnectorError(503, "Managed connector URL is invalid") from exc
+    hostname = ascii_hostname
+    try:
+        is_loopback = ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        is_loopback = hostname == "localhost"
+    if parsed.scheme == "http" and not is_loopback:
+        raise ConnectorError(503, "Remote managed connector URLs must use HTTPS")
+    port = parsed.port
+    if ":" in hostname and not hostname.startswith("["):
+        authority_host = f"[{hostname}]"
+    else:
+        authority_host = hostname
+    authority = authority_host + (f":{port}" if port is not None else "")
+    return f"{parsed.scheme}://{authority}".rstrip("/")
+
+
 class ConnectorClient:
     def __init__(self, base_url: str | None = None, token: str | None = None, timeout: float = 8.0):
-        self.base_url = (base_url or os.getenv("AUREX_CONNECTOR_SERVICE_URL", "http://127.0.0.1:8010")).rstrip("/")
+        self.base_url = validate_connector_url(base_url or os.getenv("AUREX_CONNECTOR_SERVICE_URL", "http://127.0.0.1:8010"))
         self.token = token if token is not None else os.getenv("AUREX_CONNECTOR_SERVICE_TOKEN", "").strip()
         self.timeout = timeout
+        self.opener = urllib.request.build_opener(_NoRedirectHandler())
         if not self.token:
             raise ConnectorError(503, "Managed connector authentication is not configured")
 
@@ -121,7 +193,7 @@ class ConnectorClient:
         request = urllib.request.Request(self.base_url + path, data=data, method=method,
             headers={"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with self.opener.open(request, timeout=self.timeout) as response:
                 return _safe_json(response.read())
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403): raise ConnectorError(502, "Managed connector authentication failed") from exc
@@ -139,6 +211,24 @@ class ConnectorClient:
     def tick(self, cid: str, symbol: str) -> Any: return self.request("GET", f"/v1/connections/{cid}/tick/{urllib.parse.quote(symbol, safe='')}")
     def candles(self, cid: str, symbol: str, timeframe: str, count: int) -> Any: return self.request("GET", f"/v1/connections/{cid}/candles/{urllib.parse.quote(symbol, safe='')}/{timeframe}?count={count}")
     def revoke(self, cid: str) -> Any: return self.request("DELETE", f"/v1/connections/{cid}")
+
+
+def validate_connector_configuration() -> str:
+    """Validate connector configuration without making a network request."""
+    configured_url = os.getenv("AUREX_CONNECTOR_SERVICE_URL", "").strip()
+    production = os.getenv("AUREX_ENV", "development").strip().casefold() == "production"
+    if not configured_url:
+        if production:
+            raise RuntimeError("Production requires AUREX_CONNECTOR_SERVICE_URL.")
+        configured_url = "http://127.0.0.1:8010"
+    token = os.getenv("AUREX_CONNECTOR_SERVICE_TOKEN", "").strip()
+    try:
+        normalized_url = validate_connector_url(configured_url)
+    except ConnectorError as exc:
+        raise RuntimeError(exc.message) from exc
+    if not token:
+        raise RuntimeError("AUREX_CONNECTOR_SERVICE_TOKEN is not configured.")
+    return normalized_url
 
 
 def current_user(request: Request) -> str:
@@ -169,10 +259,61 @@ def connector_http_error(exc: ConnectorError) -> HTTPException:
     return HTTPException(exc.http_status, exc.message)
 
 
-def create_app(store: ConnectionStore | None = None, client_factory: Callable[[], ConnectorClient] = ConnectorClient) -> FastAPI:
+def create_app(store: ConnectionStore | None = None, client_factory: Callable[[], ConnectorClient] = ConnectorClient,
+               auth_store: AuthStore | None = None) -> FastAPI:
+    # Validate security-critical configuration while constructing the real app.
+    # This makes invalid production settings fail before a server can accept requests.
+    validate_connector_configuration()
+    from aurex_auth import validate_auth_configuration
+    validate_auth_configuration()
     db = store or ConnectionStore()
+    accounts = auth_store or AuthStore()
     app = FastAPI(title="Aurex Managed MT5 API")
-    app.add_middleware(AurexSessionMiddleware)
+    app.add_middleware(AurexSessionMiddleware, auth_store=accounts)
+
+    @app.post("/api/auth/register", status_code=201)
+    def register(body: RegisterInput, response: Response):
+        try:
+            email = normalize_email(body.email)
+            validate_password(body.password)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        if body.password != body.confirm_password:
+            raise HTTPException(422, "Passwords do not match.")
+        try:
+            user = accounts.create_user(email, body.password)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return {"user": user}
+
+    @app.post("/api/auth/login")
+    def login(body: AuthInput, request: Request, response: Response):
+        try:
+            email = normalize_email(body.email)
+            key = client_key(request, email)
+        except ValueError as exc:
+            raise HTTPException(401, "Invalid email or password.") from exc
+        if accounts.login_blocked(key):
+            raise HTTPException(429, "Too many login attempts. Try again later.")
+        row = accounts.get_user_by_email(email)
+        if not row or not verify_password(row["password_hash"], body.password):
+            accounts.record_login_failure(key)
+            raise HTTPException(401, "Invalid email or password.")
+        accounts.clear_login_failures(key)
+        accounts.revoke_session(request.cookies.get("aurex_session"))
+        token = accounts.create_session(row["user_id"])
+        set_session_cookie(response, token)
+        return {"user": public_user(row)}
+
+    @app.post("/api/auth/logout")
+    def logout(request: Request, response: Response):
+        accounts.revoke_session(request.cookies.get("aurex_session"))
+        clear_session_cookie(response)
+        return {"ok": True}
+
+    @app.get("/api/auth/me")
+    def me(request: Request):
+        return {"user": require_user(request)}
 
     @app.get("/api/mt5/connections")
     def list_connections(user_id: str = Depends(current_user)): return {"connections": db.list_for_user(user_id)}
@@ -237,13 +378,13 @@ def create_app(store: ConnectionStore | None = None, client_factory: Callable[[]
 
     @app.delete("/api/mt5/connections/{cid}")
     def revoke(cid: str, user_id: str = Depends(current_user)):
-        record = owned(db, cid, user_id)
+        # Revocation is intentionally retryable: the connector may have
+        # revoked credentials while failing to verify process-tree cleanup.
+        # Keep the ownership check, but do not reject an already-revoked row.
+        record = owned_including_revoked(db, cid, user_id)
         try: result = client_factory().revoke(cid)
         except ConnectorError as exc: raise connector_http_error(exc)
         db.update_status(cid, "REVOKED")
         return {**record, "status": "REVOKED", "message": result.get("message", "Connection revoked")}
 
     return app
-
-
-app = create_app()

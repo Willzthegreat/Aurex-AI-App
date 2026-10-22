@@ -3,3 +3,4 @@ uvicorn[standard]>=0.30,<1.0
 MetaTrader5>=5.0.45
 pandas>=2.2,<4.0
 cryptography>=42.0,<47.0
+argon2-cffi>=23.1,<26.0

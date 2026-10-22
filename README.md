@@ -88,6 +88,27 @@ After the worker is deployed behind HTTPS, connect these server-side Floot varia
 
 All connector endpoints require `Authorization: Bearer <AUREX_CONNECTOR_SERVICE_TOKEN>`. Child-process data endpoints are loopback-only and protected by `AUREX_WORKER_INTERNAL_KEY`.
 
+### Worker shutdown and revocation safety
+
+Each managed customer worker is tracked with a Windows Job Object configured with `KILL_ON_JOB_CLOSE`, so the worker and descendant terminal processes are owned as one connection-specific process tree. The job is never selected by executable name, which prevents revocation from terminating unrelated MetaTrader terminals. Cleanup waits for both the Python worker to exit and the job to report no active descendants.
+
+Worker launch uses Windows `CREATE_SUSPENDED`; the process is assigned to the Job Object and a transactional SQLite launch row containing the launch ID, PID, and Windows creation-time identity is durably recorded before `NtResumeProcess` is called. The worker therefore cannot launch a terminal before ownership tracking is established. Launch rows move through `CREATED`, `ASSIGNED`, `RUNNING`, `READY`, `STALE`, `STOPPED`, `REVOKED`, or `RECOVERY_REQUIRED`; `RECOVERY_REQUIRED` is fail-closed and is never retried as a new worker until ownership/termination is independently verified. A service crash closes the owning Job Object handle, so `KILL_ON_JOB_CLOSE` is the process-tree recovery guarantee; persisted identities prevent duplicate startup after restart, while an unverified PID or stale/reused PID never authorizes termination or cleanup. SQLite uses WAL, a busy timeout, and `synchronous=FULL`; this is an application-level durability policy, not a claim of power-loss-proof storage.
+
+Launch-state policy:
+
+- `CREATED`: durable reservation exists, but no process identity is trusted yet. The supervisor may not start another worker. Recovery must first establish verified ownership or termination; missing identity moves the row to `RECOVERY_REQUIRED`.
+- `ASSIGNED`: the suspended process is assigned to its connection-specific Job Object and has a recorded identity. The supervisor may not start another worker. Recovery may keep the matching process or terminate it through the verified Job Object; an uncertain identity blocks cleanup.
+- `RUNNING`: the assigned process has been resumed. The supervisor may not start another worker. Recovery uses PID plus creation time and never PID alone; uncertain identity moves to `RECOVERY_REQUIRED`.
+- `READY`: the managed process is registered with the supervisor. The supervisor may not start another worker. Recovery requires verified process-tree termination before cleanup or reuse.
+- `STALE`: the recorded process identity no longer matches and no unverified terminal directory blocks reuse. The supervisor may begin a new launch after the old row is marked stale. Cleanup remains blocked if termination or directory ownership is not independently verified.
+- `STOPPED`: process-tree termination and connection-specific cleanup were verified. The supervisor may start a new worker only through a fresh `CREATED` row. Cleanup is complete; a failed verification must not be represented as `STOPPED`.
+- `REVOKED`: credentials were tombstoned and the connection is permanently non-startable. The supervisor may not start a worker. Cleanup may proceed only after process identity, Job Object emptiness, and connection-specific file removal are verified.
+- `RECOVERY_REQUIRED`: ownership or termination cannot be proven. The supervisor may not start a worker and may not delete terminal files. Recovery is fail-closed and requires independent verification before a later retry.
+
+Revocation first writes a durable revoked tombstone and clears `encrypted_credentials` under the lifecycle lock. Reconnect and supervisor paths refuse revoked or stopping records. Revocation is idempotent and returns success only after process termination and connection-specific terminal/temp-file cleanup are verified; otherwise it returns an error while retaining the revoked tombstone for retry. Terminal directories are removed only by the verified cleanup owner; setup never deletes an existing directory with a missing executable. Ordinary Windows file deletion is not secure physical erasure, especially on SSDs.
+
+The worker data directory and encryption-key storage must be owned by the dedicated Windows service account and administrators, with Modify access limited to that account. Do not grant web/static identities access. The lifecycle tests use mocked processes and temporary directories and never import or initialize the MetaTrader 5 Python connection.
+
 ### Aurex application API in this repository
 
 `aurex_backend.py` provides the customer-facing FastAPI routes under `/api/mt5`. Mount it behind the existing Aurex authentication middleware so that middleware sets `request.state.aurex_user_id`; a browser-provided user ID is never accepted. It stores only connection ownership and non-secret metadata in `AUREX_CONNECTION_DB` (default `./aurex-connections.sqlite3`) and sends broker credentials directly to the managed connector, which encrypts them at rest.
@@ -103,7 +124,17 @@ Customer routes are:
 
 Set `AUREX_CONNECTOR_SERVICE_URL` and `AUREX_CONNECTOR_SERVICE_TOKEN` only in the Aurex server environment. No route in this module calls port `8000`.
 
-For the included session adapter, set `AUREX_AUTH_SESSION_SECRET` to a separate random secret and add `AurexSessionMiddleware` to the host app. The existing Aurex login handler must call `set_session_cookie(response, authenticated_user.id)` after it verifies the user. The MT5 routes then receive the verified identity through `request.state.aurex_user_id`; they do not accept a user ID from JSON or browser headers. See `aurex_auth.py` and `aurex.env.example`.
+Customer authentication in this repository supports browser sessions only: the customer API uses an opaque, server-revocable HttpOnly cookie and CSRF origin checks. It does not accept customer bearer/API tokens. If a non-browser client is required later, add a separate scoped, expiring, revocable credential type; never reuse the connector service token.
+
+The included customer API now owns account and session storage. `AUREX_AUTH_DB` is a persistent SQLite database containing Argon2 password hashes, opaque session-token hashes, and login throttling records; it must be outside public/static directories with a restricted Windows ACL. `AUREX_CONNECTION_DB` remains a separate ownership registry. Sessions are HttpOnly, SameSite=Lax cookies and are immediately revocable in SQLite. In production set `AUREX_AUTH_COOKIE_SECURE=true`, use HTTPS, and list the public browser origin in `AUREX_TRUSTED_ORIGINS`. No password, session token, or broker credential is logged or returned. See `aurex_auth.py`, `aurex_backend.py`, and `aurex.env.example`.
+
+On Windows, create the data directory under a non-public path such as `C:\Aurex\data`, grant Modify access only to the dedicated Aurex service account (and administrators), and deny access to web/static identities. The same account should own the API process and its SQLite files.
+
+The Next.js UI uses a server-side rewrite from `/api/*` to `AUREX_API_ORIGIN` (default `http://127.0.0.1:8001`). Run the customer API on loopback port 8001 and keep the managed connector on loopback port 8010; the legacy bridge may continue to use port 8000. Do not put connector tokens in Next.js public environment variables.
+
+Connector transport validation is applied to the exact URL used by each request. Remote connector URLs must use HTTPS; plain HTTP is accepted only for literal loopback development addresses (`127.0.0.1`, `::1`, or `localhost`). Authorities with credentials, encoded/control characters, invalid IDNA, ambiguous hosts, or invalid ports are rejected, and redirects are not followed. Production application construction fails before serving if Secure cookies, HTTPS trusted origins, connector URL, or connector token settings are invalid. Trusted origins use one canonical form for DNS/IDNA names, IPv4, IPv6, and default ports; forwarded headers are not trusted by default.
+
+For a later local start, configure the environment from `aurex.env.example`, then run `uvicorn aurex_app:app --host 127.0.0.1 --port 8001` and, separately, `npm run dev`. These commands are documentation only and are not run by the offline test suite.
 
 ### Exness API adapter
 
