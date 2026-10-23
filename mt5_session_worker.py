@@ -952,6 +952,42 @@ def connection_tick(connection_id: str, symbol: str, _: bool = Depends(verify_se
     except Exception:
         raise HTTPException(status_code=503, detail="Unable to read tick from the isolated terminal session.")
 
+@app.get("/v1/connections/{connection_id}/account")
+def connection_account(connection_id: str, _: bool = Depends(verify_service_token)):
+    record = read_record(connection_id)
+    if record.get("revoked"):
+        raise HTTPException(status_code=410, detail="Connection has been revoked.")
+    state = read_state(connection_id)
+    if state.get("status") != "CONNECTED":
+        raise HTTPException(status_code=503, detail="This broker session is not connected.")
+    port = int(record["local_port"])
+    import urllib.request
+    try:
+        request = urllib.request.Request(f"http://127.0.0.1:{port}/internal/account", headers={"X-Aurex-Internal-Key": INTERNAL_KEY})
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=503, detail="Unable to read account information from the isolated terminal session.")
+
+@app.get("/v1/connections/{connection_id}/positions")
+def connection_positions(connection_id: str, account_mode: str = Query("DEMO"), _: bool = Depends(verify_service_token)):
+    if account_mode.upper() not in {"DEMO", "LIVE"}:
+        raise HTTPException(status_code=422, detail="Invalid account mode.")
+    record = read_record(connection_id)
+    if record.get("revoked"):
+        raise HTTPException(status_code=410, detail="Connection has been revoked.")
+    state = read_state(connection_id)
+    if state.get("status") != "CONNECTED":
+        raise HTTPException(status_code=503, detail="This broker session is not connected.")
+    port = int(record["local_port"])
+    import urllib.request
+    try:
+        request = urllib.request.Request(f"http://127.0.0.1:{port}/internal/positions", headers={"X-Aurex-Internal-Key": INTERNAL_KEY})
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=503, detail="Unable to read positions from the isolated terminal session.")
+
 @app.get("/v1/connections/{connection_id}/candles/{symbol}/{timeframe}")
 def connection_candles(connection_id: str, symbol: str, timeframe: str, count: int = Query(200, ge=1, le=3000), _: bool = Depends(verify_service_token)):
     import re
@@ -1029,6 +1065,33 @@ def session_worker(connection_id: str) -> None:
         if tick is None:
             raise HTTPException(status_code=503, detail="No tick available.")
         return {"symbol": symbol, "bid": tick.bid, "ask": tick.ask, "spread": round(tick.ask - tick.bid, 8), "last": tick.last, "time": datetime.fromtimestamp(tick.time, tz=timezone.utc).isoformat(), "time_msc": tick.time_msc}
+
+    @session_app.get("/internal/account")
+    def internal_account(_: bool = Depends(authorized_internal)):
+        account = mt5.account_info()
+        terminal = mt5.terminal_info()
+        if account is None or terminal is None or not terminal.connected:
+            raise HTTPException(status_code=503, detail="MT5 account information is unavailable.")
+        allowed = ("login", "trade_mode", "leverage", "limit_orders", "trade_allowed", "trade_expert",
+                   "balance", "credit", "profit", "equity", "margin", "margin_free", "margin_level",
+                   "margin_so_call", "margin_so_so", "name", "server", "currency", "company")
+        values = account._asdict()
+        return {"account": {key: values.get(key) for key in allowed}, "checked_at": datetime.now(timezone.utc).isoformat()}
+
+    @session_app.get("/internal/positions")
+    def internal_positions(_: bool = Depends(authorized_internal)):
+        if mt5.account_info() is None:
+            raise HTTPException(status_code=503, detail="MT5 account is unavailable.")
+        rows = mt5.positions_get()
+        if rows is None:
+            raise HTTPException(status_code=503, detail="MT5 positions are unavailable.")
+        allowed = ("ticket", "time", "time_msc", "type", "magic", "identifier", "reason", "volume",
+                   "price_open", "price_current", "sl", "tp", "profit", "swap", "symbol", "comment", "external_id")
+        positions = []
+        for row in rows:
+            values = row._asdict()
+            positions.append({key: values.get(key) for key in allowed})
+        return {"positions": positions, "checked_at": datetime.now(timezone.utc).isoformat()}
 
     @session_app.get("/internal/candles/{symbol}/{timeframe}")
     def internal_candles(symbol: str, timeframe: str, count: int = 200, _: bool = Depends(authorized_internal)):
