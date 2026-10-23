@@ -20,3 +20,18 @@ logs/
 terminals/
 connections/
 state/
+
+# Generated local databases and test state
+*.sqlite3
+*.sqlite
+*.db
+.worker-lifecycle-test-*/
+.aurex-auth-test-db/
+.aurex-test-db/
+
+# Historical backups and build artifacts
+.backups/
+*.bak
+*.before-recovery-fix.bak
+*.pre-merge-backup
+tsconfig.tsbuildinfo
