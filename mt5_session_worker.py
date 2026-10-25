@@ -932,6 +932,28 @@ def revoke_connection(connection_id: str, _: bool = Depends(verify_service_token
         raise HTTPException(status_code=503, detail="Connection revoked, but worker cleanup could not be verified.")
     return {"ok": True, "connection_id": connection_id, "status": "REVOKED", "worker_stopped": True, "cleanup_completed": True}
 
+@app.get("/v1/connections/{connection_id}/symbols")
+def connection_symbols(connection_id: str, _: bool = Depends(verify_service_token)):
+    """Return the symbol catalogue from this connection's isolated MT5 terminal."""
+    record = read_record(connection_id)
+    if record.get("revoked"):
+        raise HTTPException(status_code=410, detail="Connection has been revoked.")
+    state = read_state(connection_id)
+    if state.get("status") != "CONNECTED":
+        raise HTTPException(status_code=503, detail="This broker session is not connected.")
+    port = int(record["local_port"])
+    import urllib.request
+    try:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/internal/symbols",
+            headers={"X-Aurex-Internal-Key": INTERNAL_KEY},
+        )
+        with urllib.request.urlopen(request, timeout=8) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=503, detail="Unable to read symbols from the isolated terminal session.")
+
+
 @app.get("/v1/connections/{connection_id}/tick/{symbol}")
 def connection_tick(connection_id: str, symbol: str, _: bool = Depends(verify_service_token)):
     import re
@@ -1057,6 +1079,33 @@ def session_worker(connection_id: str) -> None:
     def internal_health(_: bool = Depends(authorized_internal)):
         terminal = mt5.terminal_info()
         return {"status": "CONNECTED" if terminal and terminal.connected else "RECONNECTING", "connected": bool(terminal and terminal.connected), "checked_at": now()}
+
+    @session_app.get("/internal/symbols")
+    def internal_symbols(_: bool = Depends(authorized_internal)):
+        records = mt5.symbols_get()
+        if records is None:
+            raise HTTPException(status_code=503, detail="MT5 symbol catalogue is unavailable.")
+        import re
+        pattern = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
+        catalogue = [
+            {
+                "name": item.name,
+                "description": item.description or "",
+                "path": item.path or "",
+                "visible": bool(item.visible),
+                "trade_mode": int(item.trade_mode),
+            }
+            for item in records
+            if getattr(item, "name", None) and pattern.fullmatch(str(item.name))
+        ]
+        catalogue.sort(key=lambda item: (not item["visible"], item["name"].casefold()))
+        return {
+            "symbols": catalogue,
+            "count": len(catalogue),
+            "visible_count": sum(1 for item in catalogue if item["visible"]),
+            "source": "mt5.symbols_get",
+            "checked_at": now(),
+        }
 
     @session_app.get("/internal/tick/{symbol}")
     def internal_tick(symbol: str, _: bool = Depends(authorized_internal)):
