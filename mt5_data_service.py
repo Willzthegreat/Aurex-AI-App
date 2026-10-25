@@ -192,6 +192,33 @@ def symbols(_: bool = Depends(verify_bridge_key)):
     }
 
 
+@app.get("/api/symbols")
+def symbols(_: bool = Depends(verify_bridge_key)):
+    """Return the broker's MT5 symbol catalogue for the authenticated app selector."""
+    records = mt5.symbols_get()
+    if records is None:
+        raise HTTPException(status_code=503, detail="MT5 symbol catalogue is unavailable.")
+    catalogue = [
+        {
+            "name": item.name,
+            "description": item.description or "",
+            "path": item.path or "",
+            "visible": bool(item.visible),
+            "trade_mode": int(item.trade_mode),
+        }
+        for item in records
+        if getattr(item, "name", None) and SYMBOL_PATTERN.fullmatch(str(item.name))
+    ]
+    catalogue.sort(key=lambda item: (not item["visible"], item["name"].casefold()))
+    return {
+        "symbols": catalogue,
+        "count": len(catalogue),
+        "visible_count": sum(1 for item in catalogue if item["visible"]),
+        "source": "mt5.symbols_get",
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 @app.get("/api/candles/{symbol}/{timeframe}")
 def candles(symbol: str, timeframe: str, count: int = 200, _: bool = Depends(verify_bridge_key)):
     return get_candles(symbol, timeframe, count)
