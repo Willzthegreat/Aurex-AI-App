@@ -1033,6 +1033,58 @@ def connection_candles(connection_id: str, symbol: str, timeframe: str, count: i
     except Exception:
         raise HTTPException(status_code=503, detail="Unable to read candles from the isolated terminal session.")
 
+
+@app.get("/v1/connections/{connection_id}/symbols")
+def connection_symbols(
+    connection_id: str,
+    _: bool = Depends(verify_service_token)
+):
+    record = read_record(connection_id)
+
+    if record.get("revoked"):
+        raise HTTPException(
+            status_code=410,
+            detail="Connection has been revoked."
+        )
+
+    state = read_state(connection_id)
+    if state.get("status") != "CONNECTED":
+        raise HTTPException(
+            status_code=503,
+            detail="This broker session is not connected."
+        )
+
+    port = int(record["local_port"])
+    import urllib.request
+
+    try:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/internal/symbols",
+            headers={"X-Aurex-Internal-Key": INTERNAL_KEY}
+        )
+        with urllib.request.urlopen(request, timeout=8) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+
+        if not isinstance(payload, dict) or not isinstance(
+            payload.get("symbols"), list
+        ):
+            raise HTTPException(
+                status_code=502,
+                detail="Invalid symbol list from isolated terminal."
+            )
+
+        return payload
+
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to retrieve symbols from the isolated terminal."
+        )
+
+
+
 def session_worker(connection_id: str) -> None:
     import MetaTrader5 as mt5
     from fastapi import FastAPI
@@ -1074,6 +1126,40 @@ def session_worker(connection_id: str) -> None:
         if not mt5.symbol_select(symbol, True):
             raise HTTPException(status_code=404, detail=f"Symbol {symbol} is unavailable.")
         return symbol
+
+
+    @session_app.get("/internal/symbols")
+    def internal_symbols(_: bool = Depends(authorized_internal)):
+        import re
+
+        available = mt5.symbols_get()
+        if available is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Unable to retrieve symbols from the MT5 terminal."
+            )
+
+        symbols = []
+        for item in available:
+            name = getattr(item, "name", "")
+            if not isinstance(name, str) or not re.fullmatch(
+                r"[A-Za-z0-9._-]{1,32}", name
+            ):
+                continue
+
+            symbols.append({
+                "symbol": name,
+                "description": str(getattr(item, "description", "") or ""),
+                "visible": bool(getattr(item, "visible", False)),
+            })
+
+        symbols.sort(key=lambda item: (
+            not item["visible"],
+            item["symbol"].casefold()
+        ))
+
+        return {"symbols": symbols}
+
 
     @session_app.get("/internal/health")
     def internal_health(_: bool = Depends(authorized_internal)):

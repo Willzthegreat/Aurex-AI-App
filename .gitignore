@@ -35,3 +35,10 @@ state/
 *.before-recovery-fix.bak
 *.pre-merge-backup
 tsconfig.tsbuildinfo
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local connector backups
+connector-url.backup-*.txt

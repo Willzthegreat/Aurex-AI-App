@@ -208,6 +208,8 @@ class ConnectorClient:
 
     def create(self, body: dict[str, Any]) -> Any: return self.request("POST", "/v1/connections", body)
     def status(self, cid: str) -> Any: return self.request("GET", f"/v1/connections/{urllib.parse.quote(cid, safe='')}")
+    def symbols(self, cid: str) -> Any: return self.request("GET", f"/v1/connections/{urllib.parse.quote(cid, safe='')}/symbols")
+
     def tick(self, cid: str, symbol: str) -> Any: return self.request("GET", f"/v1/connections/{cid}/tick/{urllib.parse.quote(symbol, safe='')}")
     def candles(self, cid: str, symbol: str, timeframe: str, count: int) -> Any: return self.request("GET", f"/v1/connections/{cid}/candles/{urllib.parse.quote(symbol, safe='')}/{timeframe}?count={count}")
     def revoke(self, cid: str) -> Any: return self.request("DELETE", f"/v1/connections/{cid}")
@@ -342,6 +344,68 @@ def create_app(store: ConnectionStore | None = None, client_factory: Callable[[]
         normalized = normalize_status(result.get("status"))
         db.update_status(cid, normalized)
         return {**record, "status": normalized, "message": result.get("message", ""), "last_health_at": result.get("last_health_at"), "last_connected_at": result.get("last_connected_at")}
+
+
+    @app.get("/api/mt5/connections/{cid}/symbols")
+    def get_symbols(cid: str, user_id: str = Depends(current_user)):
+        # Verify ownership and reject revoked connections before contacting
+        # the managed connector.
+        owned(db, cid, user_id)
+
+        try:
+            result = client_factory().symbols(cid)
+        except ConnectorError as exc:
+            raise connector_http_error(exc)
+
+        if not isinstance(result, dict):
+            raise HTTPException(
+                502, "Connector returned an invalid symbols response"
+            )
+
+        raw_symbols = result.get("symbols")
+        if not isinstance(raw_symbols, list):
+            raise HTTPException(
+                502, "Connector returned an invalid symbols response"
+            )
+
+        clean_symbols = []
+        seen_symbols = set()
+
+        for item in raw_symbols:
+            if not isinstance(item, dict):
+                continue
+
+            symbol_name = item.get("symbol")
+            if not isinstance(symbol_name, str):
+                continue
+
+            if not SYMBOL_RE.fullmatch(symbol_name):
+                continue
+
+            if symbol_name in seen_symbols:
+                continue
+
+            description = item.get("description", "")
+            if not isinstance(description, str):
+                description = ""
+
+            visible = item.get("visible", False)
+            if not isinstance(visible, bool):
+                visible = False
+
+            clean_symbols.append({
+                "symbol": symbol_name,
+                "description": description,
+                "visible": visible,
+            })
+            seen_symbols.add(symbol_name)
+
+        clean_symbols.sort(
+            key=lambda item: (not item["visible"], item["symbol"].casefold())
+        )
+
+        return {"symbols": clean_symbols}
+
 
     @app.get("/api/mt5/connections/{cid}/tick/{symbol}")
     def get_tick(cid: str, symbol: str, user_id: str = Depends(current_user)):
