@@ -1,4 +1,10 @@
-.chart { width: 100%; min-height: 260px; background: #101827; border-radius: 8px; }
+.chartContainer { --chart-background: #f8fbfa; --chart-scale-text: #17211f; --chart-grid: #d1dbd7; width: 100%; min-width: 0; overflow: visible; background: var(--chart-background); border-radius: 8px; }
+:global(.dark) .chartContainer { --chart-background: #101827; --chart-scale-text: #e4eeeb; --chart-grid: #33444a; }
+.chart { display: block; width: 100%; height: auto; min-height: 260px; background: var(--chart-background); border-radius: 8px; overflow: visible; }
+.priceGrid line { stroke: var(--chart-grid); stroke-width: 1; stroke-dasharray: 3 4; vector-effect: non-scaling-stroke; }
+.priceScale { color: var(--chart-scale-text); }
+.priceScale line { stroke: var(--chart-grid); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.priceScale text { fill: var(--chart-scale-text); font: 500 12px 'DM Mono', ui-monospace, monospace; }
 .chartToolbar { display: flex; justify-content: space-between; gap: 16px; margin-bottom: 8px; color: #cbd5e1; font: 14px system-ui, sans-serif; }
 .chartState { padding: 32px; color: #cbd5e1; background: #101827; border-radius: 8px; font: 14px system-ui, sans-serif; }
 .chartError { color: #fca5a5; }

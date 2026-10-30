@@ -2,8 +2,9 @@
 
 Run this service on an always-on Windows VPS with MetaTrader 5 installed.
 Each customer connection runs in a separate child process and a separate
-portable terminal directory. This service intentionally exposes no order
-execution routes; it is for connection lifecycle and market data only.
+portable terminal directory. Order execution is available only through the
+authenticated internal session endpoint and remains disabled by policy unless
+explicitly enabled by the server operator.
 """
 from __future__ import annotations
 
@@ -21,6 +22,9 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
@@ -843,6 +847,28 @@ class NewConnection(BaseModel):
     server_name: str = Field(min_length=2, max_length=160)
     credentials: dict[str, str]
 
+
+class ManagedOrder(BaseModel):
+    request_id: str = Field(min_length=36, max_length=36)
+    mode: str = Field(pattern=r"^(DEMO|LIVE)$")
+    symbol: str = Field(min_length=1, max_length=32, pattern=r"^[A-Za-z0-9._-]+$")
+    side: str = Field(pattern=r"^(BUY|SELL)$")
+    volume: float = Field(gt=0, le=1000)
+    stop_loss: float | None = Field(default=None, gt=0)
+    take_profit: float | None = Field(default=None, gt=0)
+    deviation_points: int = Field(default=20, ge=0, le=1000)
+
+
+class ManagedPosition(BaseModel):
+    request_id: str = Field(min_length=36, max_length=36)
+    mode: str = Field(pattern=r"^(DEMO|LIVE)$")
+    ticket: int = Field(gt=0)
+    symbol: str = Field(min_length=1, max_length=32, pattern=r"^[A-Za-z0-9._-]+$")
+    stop_loss: float | None = Field(default=None, gt=0)
+    take_profit: float | None = Field(default=None, gt=0)
+    volume: float | None = Field(default=None, gt=0, le=1000)
+    deviation_points: int = Field(default=20, ge=0, le=1000)
+
 app = FastAPI(title="Aurex Managed MT5 Connector", version="1.0.0")
 
 @app.on_event("startup")
@@ -1032,6 +1058,61 @@ def connection_candles(connection_id: str, symbol: str, timeframe: str, count: i
             return json.loads(response.read().decode("utf-8"))
     except Exception:
         raise HTTPException(status_code=503, detail="Unable to read candles from the isolated terminal session.")
+
+
+def _session_request(connection_id: str, path: str, method: str = "GET", body: dict[str, Any] | None = None, timeout: float = 8) -> Any:
+    record = read_record(connection_id)
+    if record.get("revoked"):
+        raise HTTPException(status_code=410, detail="Connection has been revoked.")
+    state = read_state(connection_id)
+    if state.get("status") != "CONNECTED":
+        raise HTTPException(status_code=503, detail="This broker session is not connected.")
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{int(record['local_port'])}{path}",
+        data=json.dumps(body).encode("utf-8") if body is not None else None,
+        method=method,
+        headers={"X-Aurex-Internal-Key": INTERNAL_KEY, "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = "Managed MT5 session rejected the request."
+        with contextlib.suppress(Exception):
+            detail = json.loads(exc.read().decode("utf-8")).get("detail", detail)
+        raise HTTPException(status_code=exc.code, detail=detail) from exc
+    except (TimeoutError, socket.timeout, urllib.error.URLError) as exc:
+        raise HTTPException(status_code=503, detail="Managed MT5 session outcome is uncertain; reconcile before retrying.") from exc
+
+
+@app.get("/v1/connections/{connection_id}/order-spec/{symbol}")
+def connection_order_spec(connection_id: str, symbol: str, _: bool = Depends(verify_service_token)):
+    if not __import__("re").fullmatch(r"[A-Za-z0-9._-]{1,32}", symbol):
+        raise HTTPException(status_code=422, detail="Invalid symbol.")
+    return _session_request(connection_id, f"/internal/order-spec/{urllib.parse.quote(symbol, safe='')}")
+
+
+@app.post("/v1/connections/{connection_id}/order")
+def connection_order(connection_id: str, body: ManagedOrder, _: bool = Depends(verify_service_token)):
+    return _session_request(connection_id, "/internal/order", "POST", body.model_dump() if hasattr(body, "model_dump") else body.dict(), 15)
+
+
+@app.get("/v1/connections/{connection_id}/order-reconcile/{request_id}/{symbol}")
+def connection_order_reconcile(connection_id: str, request_id: str, symbol: str, _: bool = Depends(verify_service_token)):
+    UUID(request_id)
+    if not __import__("re").fullmatch(r"[A-Za-z0-9._-]{1,32}", symbol):
+        raise HTTPException(status_code=422, detail="Invalid symbol.")
+    return _session_request(connection_id, f"/internal/order-reconcile/{request_id}/{urllib.parse.quote(symbol, safe='')}", timeout=10)
+
+
+@app.post("/v1/connections/{connection_id}/position/modify")
+def connection_position_modify(connection_id: str, body: ManagedPosition, _: bool = Depends(verify_service_token)):
+    return _session_request(connection_id, "/internal/position/modify", "POST", body.model_dump() if hasattr(body, "model_dump") else body.dict(), 15)
+
+
+@app.post("/v1/connections/{connection_id}/position/close")
+def connection_position_close(connection_id: str, body: ManagedPosition, _: bool = Depends(verify_service_token)):
+    return _session_request(connection_id, "/internal/position/close", "POST", body.model_dump() if hasattr(body, "model_dump") else body.dict(), 15)
 
 
 @app.get("/v1/connections/{connection_id}/symbols")
@@ -1227,6 +1308,184 @@ def session_worker(connection_id: str) -> None:
             values = row._asdict()
             positions.append({key: values.get(key) for key in allowed})
         return {"positions": positions, "checked_at": datetime.now(timezone.utc).isoformat()}
+
+    def execution_enabled(mode: str) -> bool:
+        if mode == "DEMO":
+            return os.getenv("AUREX_ENABLE_DEMO_ORDER_EXECUTION", "false").casefold() == "true"
+        return (os.getenv("AUREX_ENABLE_LIVE_ORDER_EXECUTION", "false").casefold() == "true"
+                and os.getenv("AUREX_LIVE_EXECUTION_AUTHORIZED", "false").casefold() == "true")
+
+    def json_values(value: Any) -> Any:
+        if hasattr(value, "_asdict"):
+            return {key: json_values(item) for key, item in value._asdict().items()}
+        if isinstance(value, (list, tuple)):
+            return [json_values(item) for item in value]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return str(value)
+
+    def order_result(result: Any, request_id: str, symbol: str, mode: str, fallback_status: str = "UNKNOWN") -> dict[str, Any]:
+        values = json_values(result) if result is not None else {}
+        retcode = int(values.get("retcode", -1)) if isinstance(values, dict) else -1
+        mapping = {10009: "FILLED", 10008: "ACCEPTED", 10010: "PARTIALLY_FILLED", 10007: "CANCELLED"}
+        status = mapping.get(retcode, fallback_status if retcode < 0 else "REJECTED")
+        return {"status": status, "request_id": request_id, "mode": mode, "symbol": symbol,
+                "retcode": retcode, "broker_comment": values.get("comment", "") if isinstance(values, dict) else "",
+                "order_ticket": values.get("order", 0) if isinstance(values, dict) else 0,
+                "deal_ticket": values.get("deal", 0) if isinstance(values, dict) else 0,
+                "fill_price": values.get("price", 0) if isinstance(values, dict) else 0,
+                "executed_volume": values.get("volume", 0) if isinstance(values, dict) else 0,
+                "checked_at": now()}
+
+    def account_and_symbol(body: ManagedOrder | ManagedPosition):
+        terminal = mt5.terminal_info()
+        account = mt5.account_info()
+        if terminal is None or not terminal.connected or account is None:
+            raise HTTPException(status_code=503, detail="MT5 terminal is not connected.")
+        expected = 0 if body.mode == "DEMO" else 2
+        if int(getattr(account, "trade_mode", -1)) != expected:
+            raise HTTPException(status_code=409, detail="Connected MT5 account mode does not match the requested mode.")
+        if not execution_enabled(body.mode):
+            raise HTTPException(status_code=423, detail=f"{body.mode} broker execution is disabled by server policy.")
+        if not bool(getattr(account, "trade_allowed", False)) or not bool(getattr(account, "trade_expert", False)):
+            raise HTTPException(status_code=409, detail="Broker trading permissions are disabled.")
+        validate_symbol(body.symbol)
+        info = mt5.symbol_info(body.symbol)
+        tick = mt5.symbol_info_tick(body.symbol)
+        if info is None or tick is None or float(getattr(tick, "bid", 0)) <= 0 or float(getattr(tick, "ask", 0)) <= 0:
+            raise HTTPException(status_code=503, detail="Selected symbol quote is unavailable.")
+        if int(getattr(info, "trade_mode", 0)) == 0:
+            raise HTTPException(status_code=409, detail="Selected symbol is not tradable.")
+        return account, info, tick
+
+    def filling_policy(info: Any) -> int:
+        mask = int(getattr(info, "filling_mode", 0))
+        if mask & int(getattr(mt5, "SYMBOL_FILLING_FOK", 1)):
+            return int(getattr(mt5, "ORDER_FILLING_FOK", 0))
+        if mask & int(getattr(mt5, "SYMBOL_FILLING_IOC", 2)):
+            return int(getattr(mt5, "ORDER_FILLING_IOC", 1))
+        raise HTTPException(status_code=409, detail="Broker did not advertise a supported market filling policy.")
+
+    def validate_volume(info: Any, volume: float) -> None:
+        minimum, maximum, step = float(info.volume_min), float(info.volume_max), float(info.volume_step)
+        if volume < minimum or volume > maximum or step <= 0:
+            raise HTTPException(status_code=422, detail="Volume is outside broker limits.")
+        if abs((volume - minimum) / step - round((volume - minimum) / step)) > 1e-6:
+            raise HTTPException(status_code=422, detail="Volume does not match the broker volume step.")
+
+    @session_app.get("/internal/order-spec/{symbol}")
+    def internal_order_spec(symbol: str, _: bool = Depends(authorized_internal)):
+        validate_symbol(symbol)
+        account, info, tick = account_and_symbol(ManagedPosition(request_id=str(uuid4()), mode="DEMO", ticket=1, symbol=symbol))
+        values = info._asdict()
+        return {"symbol": symbol, "available": True, "bid": float(tick.bid), "ask": float(tick.ask),
+                "point": float(values.get("point", 0)), "digits": int(values.get("digits", 0)),
+                "trade_mode": int(values.get("trade_mode", 0)), "filling_mode": int(values.get("filling_mode", 0)),
+                "volume_min": float(values.get("volume_min", 0)), "volume_max": float(values.get("volume_max", 0)),
+                "volume_step": float(values.get("volume_step", 0)), "trade_stops_level": int(values.get("trade_stops_level", 0)),
+                "trade_freeze_level": int(values.get("trade_freeze_level", 0)), "trade_tick_size": float(values.get("trade_tick_size", 0)),
+                "trade_tick_value": float(values.get("trade_tick_value", 0)), "trade_allowed": bool(getattr(account, "trade_allowed", False)),
+                "margin_free": float(getattr(account, "margin_free", 0)), "account_trade_mode": int(getattr(account, "trade_mode", -1)), "checked_at": now()}
+
+    @session_app.post("/internal/order")
+    def internal_order(body: ManagedOrder, _: bool = Depends(authorized_internal)):
+        account, info, tick = account_and_symbol(body)
+        validate_volume(info, body.volume)
+        trade_mode = int(getattr(info, "trade_mode", 0))
+        if (body.side == "BUY" and trade_mode == 2) or (body.side == "SELL" and trade_mode == 1) or trade_mode == 3:
+            raise HTTPException(status_code=409, detail="Selected symbol does not permit this direction.")
+        point = float(getattr(info, "point", 0))
+        price = float(tick.ask if body.side == "BUY" else tick.bid)
+        minimum_distance = int(getattr(info, "trade_stops_level", 0)) * point
+        if body.stop_loss is not None and ((body.side == "BUY" and body.stop_loss >= price - minimum_distance) or (body.side == "SELL" and body.stop_loss <= price + minimum_distance)):
+            raise HTTPException(status_code=422, detail="Stop-loss violates broker stop-level restrictions.")
+        if body.take_profit is not None and ((body.side == "BUY" and body.take_profit <= price + minimum_distance) or (body.side == "SELL" and body.take_profit >= price - minimum_distance)):
+            raise HTTPException(status_code=422, detail="Take-profit violates broker stop-level restrictions.")
+        order_type = mt5.ORDER_TYPE_BUY if body.side == "BUY" else mt5.ORDER_TYPE_SELL
+        request = {"action": mt5.TRADE_ACTION_DEAL, "symbol": body.symbol, "volume": body.volume, "type": order_type,
+                   "price": price, "sl": body.stop_loss or 0.0, "tp": body.take_profit or 0.0,
+                   "deviation": body.deviation_points, "magic": 918273, "comment": f"KLY:{body.request_id}",
+                   "type_time": mt5.ORDER_TIME_GTC, "type_filling": filling_policy(info)}
+        margin = mt5.order_calc_margin(order_type, body.symbol, body.volume, price)
+        if margin is None or float(margin) > float(getattr(account, "margin_free", 0)):
+            raise HTTPException(status_code=409, detail="Insufficient free margin for this order.")
+        checked = mt5.order_check(request)
+        if checked is None:
+            raise HTTPException(status_code=503, detail="Broker order check returned no result.")
+        checked_values = json_values(checked)
+        if int(checked_values.get("retcode", -1)) not in (0, 10009):
+            raise HTTPException(status_code=409, detail="Broker rejected the order during order check.")
+        result = mt5.order_send(request)
+        if result is None:
+            raise HTTPException(status_code=503, detail="Order submission outcome is uncertain; reconcile before retrying.")
+        return order_result(result, body.request_id, body.symbol, body.mode)
+
+    @session_app.get("/internal/order-reconcile/{request_id}/{symbol}")
+    def internal_order_reconcile(request_id: str, symbol: str, _: bool = Depends(authorized_internal)):
+        UUID(request_id)
+        validate_symbol(symbol)
+        marker = f"KLY:{request_id}"
+        end = datetime.now(timezone.utc)
+        start = end.timestamp() - 86400
+        orders = mt5.history_orders_get(datetime.fromtimestamp(start, timezone.utc), end) or []
+        deals = mt5.history_deals_get(datetime.fromtimestamp(start, timezone.utc), end) or []
+        matching_orders = [json_values(item) for item in orders if getattr(item, "symbol", "") == symbol and marker in str(getattr(item, "comment", ""))]
+        matching_deals = [json_values(item) for item in deals if getattr(item, "symbol", "") == symbol and marker in str(getattr(item, "comment", ""))]
+        if matching_deals:
+            deal = matching_deals[-1]
+            return {"status": "FILLED", "request_id": request_id, "symbol": symbol, "deal_ticket": deal.get("ticket", 0), "fill_price": deal.get("price", 0), "executed_volume": deal.get("volume", 0), "reconciled_at": now()}
+        if matching_orders:
+            order = matching_orders[-1]
+            return {"status": "ACCEPTED", "request_id": request_id, "symbol": symbol, "order_ticket": order.get("ticket", 0), "broker_comment": order.get("comment", ""), "reconciled_at": now()}
+        return {"status": "UNKNOWN", "request_id": request_id, "symbol": symbol, "reconciled_at": now()}
+
+    def position_for(ticket: int, symbol: str):
+        validate_symbol(symbol)
+        rows = mt5.positions_get(ticket=ticket) or []
+        position = next((row for row in rows if int(getattr(row, "ticket", 0)) == ticket and getattr(row, "symbol", "") == symbol), None)
+        if position is None:
+            raise HTTPException(status_code=404, detail="Position ticket was not found for the exact symbol.")
+        return position
+
+    @session_app.post("/internal/position/modify")
+    def internal_position_modify(body: ManagedPosition, _: bool = Depends(authorized_internal)):
+        account, info, tick = account_and_symbol(body)
+        position = position_for(body.ticket, body.symbol)
+        point = float(getattr(info, "point", 0))
+        price = float(tick.bid if int(getattr(position, "type", 0)) == int(getattr(mt5, "POSITION_TYPE_BUY", 0)) else tick.ask)
+        distance = int(getattr(info, "trade_stops_level", 0)) * point
+        if body.stop_loss is not None and ((int(getattr(position, "type", 0)) == int(getattr(mt5, "POSITION_TYPE_BUY", 0)) and body.stop_loss >= price - distance) or (int(getattr(position, "type", 0)) != int(getattr(mt5, "POSITION_TYPE_BUY", 0)) and body.stop_loss <= price + distance)):
+            raise HTTPException(status_code=422, detail="Stop-loss violates broker stop-level restrictions.")
+        request = {"action": mt5.TRADE_ACTION_SLTP, "symbol": body.symbol, "position": body.ticket,
+                   "sl": body.stop_loss or 0.0, "tp": body.take_profit or 0.0, "magic": 918273, "comment": f"KLY:{body.request_id}"}
+        checked = mt5.order_check(request)
+        if checked is None or int(getattr(checked, "retcode", -1)) not in (0, 10009):
+            raise HTTPException(status_code=409, detail="Broker rejected the position modification during order check.")
+        result = mt5.order_send(request)
+        if result is None:
+            raise HTTPException(status_code=503, detail="Position modification outcome is uncertain; reconcile manually.")
+        return order_result(result, body.request_id, body.symbol, body.mode)
+
+    @session_app.post("/internal/position/close")
+    def internal_position_close(body: ManagedPosition, _: bool = Depends(authorized_internal)):
+        account, info, tick = account_and_symbol(body)
+        position = position_for(body.ticket, body.symbol)
+        volume = float(body.volume or getattr(position, "volume", 0))
+        validate_volume(info, volume)
+        position_type = int(getattr(position, "type", 0))
+        buy = int(getattr(mt5, "POSITION_TYPE_BUY", 0))
+        order_type = mt5.ORDER_TYPE_SELL if position_type == buy else mt5.ORDER_TYPE_BUY
+        price = float(tick.bid if position_type == buy else tick.ask)
+        request = {"action": mt5.TRADE_ACTION_DEAL, "symbol": body.symbol, "position": body.ticket, "volume": volume,
+                   "type": order_type, "price": price, "deviation": body.deviation_points, "magic": 918273,
+                   "comment": f"KLY:{body.request_id}", "type_time": mt5.ORDER_TIME_GTC, "type_filling": filling_policy(info)}
+        checked = mt5.order_check(request)
+        if checked is None or int(getattr(checked, "retcode", -1)) not in (0, 10009):
+            raise HTTPException(status_code=409, detail="Broker rejected the position close during order check.")
+        result = mt5.order_send(request)
+        if result is None:
+            raise HTTPException(status_code=503, detail="Position close outcome is uncertain; reconcile manually.")
+        return order_result(result, body.request_id, body.symbol, body.mode)
 
     @session_app.get("/internal/candles/{symbol}/{timeframe}")
     def internal_candles(symbol: str, timeframe: str, count: int = 200, _: bool = Depends(authorized_internal)):

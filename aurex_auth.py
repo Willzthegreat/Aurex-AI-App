@@ -67,6 +67,12 @@ class AuthStore:
                 attempt_key TEXT PRIMARY KEY, window_started INTEGER NOT NULL,
                 failures INTEGER NOT NULL
             )""")
+            db.execute("""CREATE TABLE IF NOT EXISTS user_permissions (
+                user_id TEXT NOT NULL,
+                permission TEXT NOT NULL,
+                granted_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, permission)
+            )""")
 
     def _db(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path, timeout=5)
@@ -136,6 +142,20 @@ class AuthStore:
     def clear_login_failures(self, key: str) -> None:
         with self._db() as db:
             db.execute("DELETE FROM login_attempts WHERE attempt_key=?", (key,))
+
+    def has_permission(self, user_id: str, permission: str) -> bool:
+        with self._db() as db:
+            return db.execute(
+                "SELECT 1 FROM user_permissions WHERE user_id=? AND permission=?",
+                (user_id, permission),
+            ).fetchone() is not None
+
+    def grant_permission(self, user_id: str, permission: str) -> None:
+        with self._db() as db:
+            db.execute(
+                "INSERT OR IGNORE INTO user_permissions (user_id, permission, granted_at) VALUES (?,?,?)",
+                (user_id, permission, datetime.now(timezone.utc).isoformat()),
+            )
 
 
 def hash_token(token: str) -> str:

@@ -18,7 +18,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 from uuid import UUID, uuid4
 from urllib.parse import urlsplit
 
@@ -28,6 +28,7 @@ from pydantic import BaseModel, Field, field_validator
 from aurex_auth import (AuthStore, AurexSessionMiddleware, client_key, clear_session_cookie,
                         normalize_email, public_user, require_user, set_session_cookie,
                         validate_password, verify_password)
+from aurex_execution import ExecutionStore, utc_now
 
 SYMBOL_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
 TIMEFRAMES = {"M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1", "MN1"}
@@ -49,6 +50,35 @@ class ConnectionInput(BaseModel):
         if not value.isdigit():
             raise ValueError("MT5 login must be numeric")
         return value
+
+
+class OrderInput(BaseModel):
+    connection_id: str
+    mode: Literal["DEMO", "LIVE"] = "DEMO"
+    symbol: str = Field(min_length=1, max_length=32, pattern=r"^[^\s\x00-\x1f/\\]+$")
+    side: Literal["BUY", "SELL"]
+    volume: float = Field(gt=0, le=1000)
+    stop_loss: float | None = Field(default=None, gt=0)
+    take_profit: float | None = Field(default=None, gt=0)
+    deviation_points: int = Field(default=20, ge=0, le=1000)
+    client_order_key: str = Field(min_length=16, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
+
+
+class PositionInput(BaseModel):
+    connection_id: str
+    mode: Literal["DEMO", "LIVE"] = "DEMO"
+    ticket: int = Field(gt=0)
+    symbol: str = Field(min_length=1, max_length=32, pattern=r"^[^\s\x00-\x1f/\\]+$")
+    stop_loss: float | None = Field(default=None, gt=0)
+    take_profit: float | None = Field(default=None, gt=0)
+    volume: float | None = Field(default=None, gt=0, le=1000)
+    deviation_points: int = Field(default=20, ge=0, le=1000)
+    client_order_key: str = Field(min_length=16, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
+
+
+def execution_flag(mode: str) -> bool:
+    name = "AUREX_ENABLE_DEMO_ORDER_EXECUTION" if mode == "DEMO" else "AUREX_ENABLE_LIVE_ORDER_EXECUTION"
+    return os.getenv(name, "false").strip().casefold() in {"1", "true", "yes", "on"}
 
 
 class AuthInput(BaseModel):
@@ -209,9 +239,16 @@ class ConnectorClient:
     def create(self, body: dict[str, Any]) -> Any: return self.request("POST", "/v1/connections", body)
     def status(self, cid: str) -> Any: return self.request("GET", f"/v1/connections/{urllib.parse.quote(cid, safe='')}")
     def symbols(self, cid: str) -> Any: return self.request("GET", f"/v1/connections/{urllib.parse.quote(cid, safe='')}/symbols")
+    def account(self, cid: str) -> Any: return self.request("GET", f"/v1/connections/{urllib.parse.quote(cid, safe='')}/account")
+    def positions(self, cid: str) -> Any: return self.request("GET", f"/v1/connections/{urllib.parse.quote(cid, safe='')}/positions")
 
     def tick(self, cid: str, symbol: str) -> Any: return self.request("GET", f"/v1/connections/{cid}/tick/{urllib.parse.quote(symbol, safe='')}")
     def candles(self, cid: str, symbol: str, timeframe: str, count: int) -> Any: return self.request("GET", f"/v1/connections/{cid}/candles/{urllib.parse.quote(symbol, safe='')}/{timeframe}?count={count}")
+    def order_spec(self, cid: str, symbol: str) -> Any: return self.request("GET", f"/v1/connections/{urllib.parse.quote(cid, safe='')}/order-spec/{urllib.parse.quote(symbol, safe='')}")
+    def submit_order(self, cid: str, body: dict[str, Any]) -> Any: return self.request("POST", f"/v1/connections/{urllib.parse.quote(cid, safe='')}/order", body)
+    def reconcile_order(self, cid: str, request_id: str, symbol: str) -> Any: return self.request("GET", f"/v1/connections/{urllib.parse.quote(cid, safe='')}/order-reconcile/{urllib.parse.quote(request_id, safe='')}/{urllib.parse.quote(symbol, safe='')}")
+    def modify_position(self, cid: str, body: dict[str, Any]) -> Any: return self.request("POST", f"/v1/connections/{urllib.parse.quote(cid, safe='')}/position/modify", body)
+    def close_position(self, cid: str, body: dict[str, Any]) -> Any: return self.request("POST", f"/v1/connections/{urllib.parse.quote(cid, safe='')}/position/close", body)
     def revoke(self, cid: str) -> Any: return self.request("DELETE", f"/v1/connections/{cid}")
 
 
@@ -270,8 +307,55 @@ def create_app(store: ConnectionStore | None = None, client_factory: Callable[[]
     validate_auth_configuration()
     db = store or ConnectionStore()
     accounts = auth_store or AuthStore()
+    executions = ExecutionStore()
     app = FastAPI(title="Aurex Managed MT5 API")
     app.add_middleware(AurexSessionMiddleware, auth_store=accounts)
+
+    def require_execution_access(user_id: str, body: OrderInput | PositionInput) -> dict[str, Any]:
+        record = owned(db, body.connection_id, user_id)
+        if not accounts.has_permission(user_id, "trading.orders.execute"):
+            raise HTTPException(403, "Order execution permission is required")
+        if not execution_flag(body.mode):
+            raise HTTPException(423, f"{body.mode} broker execution is disabled by server policy")
+        if body.mode == "LIVE" and os.getenv("AUREX_LIVE_EXECUTION_AUTHORIZED", "false").casefold() != "true":
+            raise HTTPException(423, "LIVE broker execution requires explicit server authorization")
+        return record
+
+    def verify_order_context(client: ConnectorClient, body: OrderInput, user_id: str) -> dict[str, Any]:
+        record = require_execution_access(user_id, body)
+        status = client.status(body.connection_id)
+        if normalize_status(status.get("status")) != "CONNECTED":
+            raise HTTPException(409, "The selected managed MT5 session is not connected")
+        account_response = client.account(body.connection_id)
+        account = account_response.get("account", account_response) if isinstance(account_response, dict) else {}
+        expected_mode = 0 if body.mode == "DEMO" else 2
+        if account.get("trade_mode") != expected_mode:
+            raise HTTPException(409, "The connected MT5 account mode does not match the requested mode")
+        if account.get("trade_allowed") is False:
+            raise HTTPException(409, "Trading is disabled on the connected MT5 account")
+        spec = client.order_spec(body.connection_id, body.symbol)
+        if spec.get("symbol") != body.symbol or spec.get("available") is False:
+            raise HTTPException(422, "The exact selected symbol is unavailable on this account")
+        bid, ask = spec.get("bid"), spec.get("ask")
+        if not all(isinstance(value, (int, float)) and math.isfinite(float(value)) and float(value) > 0 for value in (bid, ask)):
+            raise HTTPException(502, "The managed connector returned an invalid quote")
+        minimum, maximum, step = (float(spec.get(key, 0)) for key in ("volume_min", "volume_max", "volume_step"))
+        if minimum <= 0 or maximum < minimum or step <= 0 or body.volume < minimum or body.volume > maximum:
+            raise HTTPException(422, "Order volume is outside the broker limits")
+        steps = round((body.volume - minimum) / step)
+        if not math.isclose(minimum + steps * step, body.volume, rel_tol=0, abs_tol=max(step * 1e-6, 1e-9)):
+            raise HTTPException(422, "Order volume does not match the broker volume step")
+        trade_mode = int(spec.get("trade_mode", 4))
+        if trade_mode in (0, 3) or (body.side == "BUY" and trade_mode == 2) or (body.side == "SELL" and trade_mode == 1):
+            raise HTTPException(409, "The selected symbol does not permit this order direction")
+        point = float(spec.get("point", 0))
+        stops = float(spec.get("trade_stops_level", 0)) * point
+        price = float(ask if body.side == "BUY" else bid)
+        if body.stop_loss is not None and ((body.side == "BUY" and body.stop_loss >= price - stops) or (body.side == "SELL" and body.stop_loss <= price + stops)):
+            raise HTTPException(422, "Stop-loss violates the broker stop-level rule")
+        if body.take_profit is not None and ((body.side == "BUY" and body.take_profit <= price + stops) or (body.side == "SELL" and body.take_profit >= price - stops)):
+            raise HTTPException(422, "Take-profit violates the broker stop-level rule")
+        return {"record": record, "account": account, "spec": spec}
 
     @app.post("/api/auth/register", status_code=201)
     def register(body: RegisterInput, response: Response):
@@ -439,6 +523,112 @@ def create_app(store: ConnectionStore | None = None, client_factory: Callable[[]
         clean.sort(key=lambda item: item["time"])
         unique = {item["time"]: item for item in clean}
         return {"symbol": symbol, "timeframe": timeframe, "count": len(unique), "candles": list(unique.values())}
+
+    @app.get("/api/mt5/connections/{cid}/execution-readiness")
+    def execution_readiness(cid: str, mode: Literal["DEMO", "LIVE"] = "DEMO", user_id: str = Depends(current_user)):
+        owned(db, cid, user_id)
+        if not accounts.has_permission(user_id, "trading.orders.execute"):
+            return {"status": "PERMISSION_REQUIRED", "mode": mode}
+        if not execution_flag(mode) or (mode == "LIVE" and os.getenv("AUREX_LIVE_EXECUTION_AUTHORIZED", "false").casefold() != "true"):
+            return {"status": "LIVE_DISABLED" if mode == "LIVE" else "DEMO_DISABLED", "mode": mode}
+        try:
+            result = client_factory().status(cid)
+            if normalize_status(result.get("status")) != "CONNECTED":
+                return {"status": normalize_status(result.get("status")), "mode": mode}
+            account_response = client_factory().account(cid)
+            account = account_response.get("account", account_response) if isinstance(account_response, dict) else {}
+            expected_mode = 0 if mode == "DEMO" else 2
+            if account.get("trade_mode") != expected_mode or account.get("trade_allowed") is False:
+                return {"status": "ACCOUNT_MODE_MISMATCH", "mode": mode}
+            return {"status": "DEMO_READY" if mode == "DEMO" else "LIVE_READY", "mode": mode}
+        except ConnectorError as exc:
+            return {"status": "DISCONNECTED", "mode": mode, "error": exc.message}
+
+    @app.post("/api/mt5/orders", status_code=202)
+    def submit_order(body: OrderInput, user_id: str = Depends(current_user)):
+        existing = executions.by_key(user_id, body.connection_id, body.client_order_key)
+        if existing:
+            return {"execution": existing, "idempotent": True}
+        client = client_factory()
+        verify_order_context(client, body, user_id)
+        payload = body.model_dump() if hasattr(body, "model_dump") else body.dict()
+        try:
+            execution = executions.create(user_id, body.connection_id, body.client_order_key, body.mode, payload)
+        except sqlite3.IntegrityError:
+            existing = executions.by_key(user_id, body.connection_id, body.client_order_key)
+            if existing:
+                return {"execution": existing, "idempotent": True}
+            raise HTTPException(409, "Execution request already exists")
+        executions.audit(execution["request_id"], user_id, body.connection_id, "VALIDATED", {"symbol": body.symbol, "mode": body.mode})
+        broker_payload = {**payload, "request_id": execution["request_id"]}
+        try:
+            result = client.submit_order(body.connection_id, broker_payload)
+        except ConnectorError as exc:
+            if exc.http_status in (502, 503, 504):
+                try:
+                    result = client.reconcile_order(body.connection_id, execution["request_id"], body.symbol)
+                except ConnectorError:
+                    executions.update(execution["request_id"], "RECONCILIATION_REQUIRED", {"error": "Broker outcome is uncertain"})
+                    executions.audit(execution["request_id"], user_id, body.connection_id, "RECONCILIATION_REQUIRED", {})
+                    return {"execution": executions.get(execution["request_id"])}
+            else:
+                executions.update(execution["request_id"], "REJECTED", {"error": exc.message})
+                executions.audit(execution["request_id"], user_id, body.connection_id, "REJECTED", {"error": exc.message})
+                raise connector_http_error(exc)
+        status = str(result.get("status", "UNKNOWN")).upper() if isinstance(result, dict) else "UNKNOWN"
+        if status not in {"REJECTED", "ACCEPTED", "FILLED", "PARTIALLY_FILLED", "PENDING", "CANCELLED", "UNKNOWN", "RECONCILIATION_REQUIRED"}:
+            status = "UNKNOWN"
+        saved = executions.update(execution["request_id"], status, result if isinstance(result, dict) else {"error": "Invalid broker response"})
+        executions.audit(execution["request_id"], user_id, body.connection_id, status, {"symbol": body.symbol})
+        return {"execution": saved}
+
+    @app.post("/api/mt5/orders/{request_id}/reconcile")
+    def reconcile_order(request_id: str, user_id: str = Depends(current_user)):
+        execution = executions.get(request_id)
+        if not execution or execution["user_id"] != user_id:
+            raise HTTPException(404, "Execution request not found")
+        owned(db, execution["connection_id"], user_id)
+        result = client_factory().reconcile_order(execution["connection_id"], request_id, execution["payload"]["symbol"])
+        status = str(result.get("status", "UNKNOWN")).upper()
+        saved = executions.update(request_id, status, result)
+        executions.audit(request_id, user_id, execution["connection_id"], "RECONCILED", {"status": status})
+        return {"execution": saved}
+
+    def position_action(body: PositionInput, user_id: str, close: bool):
+        existing = executions.by_key(user_id, body.connection_id, body.client_order_key)
+        if existing:
+            return {"execution": existing, "idempotent": True}
+        require_execution_access(user_id, body)
+        payload = body.model_dump() if hasattr(body, "model_dump") else body.dict()
+        try:
+            execution = executions.create(user_id, body.connection_id, body.client_order_key, body.mode, payload)
+        except sqlite3.IntegrityError:
+            existing = executions.by_key(user_id, body.connection_id, body.client_order_key)
+            if existing:
+                return {"execution": existing, "idempotent": True}
+            raise HTTPException(409, "Execution request already exists")
+        payload["request_id"] = execution["request_id"]
+        try:
+            result = client_factory().close_position(body.connection_id, payload) if close else client_factory().modify_position(body.connection_id, payload)
+        except ConnectorError as exc:
+            executions.update(execution["request_id"], "REJECTED", {"error": exc.message})
+            raise connector_http_error(exc)
+        status = str(result.get("status", "UNKNOWN")).upper() if isinstance(result, dict) else "UNKNOWN"
+        saved = executions.update(execution["request_id"], status, result if isinstance(result, dict) else {})
+        executions.audit(execution["request_id"], user_id, body.connection_id, status, {"symbol": body.symbol, "ticket": body.ticket})
+        return {"execution": saved}
+
+    @app.post("/api/mt5/positions/modify", status_code=202)
+    def modify_position(body: PositionInput, user_id: str = Depends(current_user)):
+        if body.stop_loss is None and body.take_profit is None:
+            raise HTTPException(422, "At least one position protection level is required")
+        return position_action(body, user_id, False)
+
+    @app.post("/api/mt5/positions/close", status_code=202)
+    def close_position(body: PositionInput, user_id: str = Depends(current_user)):
+        if body.volume is None:
+            raise HTTPException(422, "Close volume is required")
+        return position_action(body, user_id, True)
 
     @app.delete("/api/mt5/connections/{cid}")
     def revoke(cid: str, user_id: str = Depends(current_user)):

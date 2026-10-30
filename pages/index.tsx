@@ -140,6 +140,66 @@ export default function Home() {
 
   const [timeframe, setTimeframe] = useState("M15");
   const [error, setError] = useState("");
+  const [executionMode, setExecutionMode] = useState<"DEMO" | "LIVE">("DEMO");
+  const [orderSide, setOrderSide] = useState<"BUY" | "SELL">("BUY");
+  const [orderVolume, setOrderVolume] = useState("0.01");
+  const [stopLoss, setStopLoss] = useState("");
+  const [takeProfit, setTakeProfit] = useState("");
+  const [executionStatus, setExecutionStatus] = useState("DISCONNECTED");
+  const [executionMessage, setExecutionMessage] = useState("");
+  const [submittingOrder, setSubmittingOrder] = useState(false);
+
+  useEffect(() => {
+    if (!connectionId || !user) {
+      setExecutionStatus("DISCONNECTED");
+      return;
+    }
+    let cancelled = false;
+    setExecutionStatus("CONNECTING");
+    fetch(`/api/mt5/connections/${encodeURIComponent(connectionId)}/execution-readiness?mode=${executionMode}`, { credentials: "same-origin" })
+      .then(async response => response.json().catch(() => ({})))
+      .then(payload => {
+        if (cancelled) return;
+        setExecutionStatus(String(payload.status || "DISCONNECTED"));
+        setExecutionMessage(payload.error || "");
+      })
+      .catch(() => { if (!cancelled) setExecutionStatus("DISCONNECTED"); });
+    return () => { cancelled = true; };
+  }, [connectionId, executionMode, user]);
+
+  async function submitBrokerOrder() {
+    if (!connectionId || !symbol || executionMode !== "DEMO") return;
+    setSubmittingOrder(true);
+    setExecutionStatus("EXECUTING");
+    setExecutionMessage("");
+    try {
+      const response = await fetch("/api/mt5/orders", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          connection_id: connectionId,
+          mode: executionMode,
+          symbol,
+          side: orderSide,
+          volume: Number(orderVolume),
+          stop_loss: stopLoss ? Number(stopLoss) : undefined,
+          take_profit: takeProfit ? Number(takeProfit) : undefined,
+          client_order_key: `manual-${crypto.randomUUID()}`,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.detail || "The broker rejected the order request.");
+      const execution = payload.execution || {};
+      setExecutionStatus(String(execution.status || "UNKNOWN"));
+      setExecutionMessage(execution.result?.broker_comment || execution.result?.error || "Broker response received.");
+    } catch (reason) {
+      setExecutionStatus("ORDER REJECTED");
+      setExecutionMessage(reason instanceof Error ? reason.message : "Unable to submit the order.");
+    } finally {
+      setSubmittingOrder(false);
+    }
+  }
 
   // Verify the user's login session.
   useEffect(() => {
@@ -487,6 +547,21 @@ export default function Home() {
           )}
 
           {symbolError && <p role="alert">{symbolError}</p>}
+
+          <section style={{ border: "1px solid #d8dee9", borderRadius: 8, padding: 16, marginBottom: 20 }} aria-label="Broker order execution">
+            <h2 style={{ marginTop: 0 }}>Broker execution</h2>
+            <p aria-live="polite">Status: <strong>{executionStatus}</strong>{executionMessage ? ` — ${executionMessage}` : ""}</p>
+            <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "end" }}>
+              <label>Mode <select value={executionMode} onChange={event => setExecutionMode(event.target.value as "DEMO" | "LIVE")}><option value="DEMO">DEMO</option><option value="LIVE">LIVE</option></select></label>
+              <label>Direction <select value={orderSide} onChange={event => setOrderSide(event.target.value as "BUY" | "SELL")}><option value="BUY">BUY</option><option value="SELL">SELL</option></select></label>
+              <label>Volume <input inputMode="decimal" value={orderVolume} onChange={event => setOrderVolume(event.target.value)} /></label>
+              <label>Stop-loss <input inputMode="decimal" value={stopLoss} onChange={event => setStopLoss(event.target.value)} placeholder="Optional" /></label>
+              <label>Take-profit <input inputMode="decimal" value={takeProfit} onChange={event => setTakeProfit(event.target.value)} placeholder="Optional" /></label>
+              <button type="button" onClick={() => void submitBrokerOrder()} disabled={submittingOrder || executionMode !== "DEMO" || executionStatus !== "DEMO_READY" || !symbol}>{submittingOrder ? "Executing…" : "Review and submit DEMO order"}</button>
+            </div>
+            {executionMode === "LIVE" && <p>LIVE execution is disabled by server policy until independently authorized.</p>}
+            <p style={{ fontSize: 13 }}>Exact selected symbol: <code>{symbol || "none"}</code>. Orders are sent only to the selected managed MT5 connection.</p>
+          </section>
 
           {connectionId && symbol && !symbolError && (
             <Mt5TradingChart

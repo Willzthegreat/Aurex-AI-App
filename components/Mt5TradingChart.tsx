@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import styles from "./Mt5TradingChart.module.css";
 
 type Candle = { time: string; open: number; high: number; low: number; close: number };
@@ -23,14 +23,33 @@ function normalizeCandles(value: unknown): Candle[] {
     if (![open, high, low, close].every(Number.isFinite)) continue;
     byTime.set(row.time, { time: row.time, open, high, low, close });
   }
-  return [...byTime.values()].sort((a, b) => Date.parse(a.time) - Date.parse(b.time));
+  return Array.from(byTime.values()).sort((a, b) => Date.parse(a.time) - Date.parse(b.time));
 }
 
 export default function Mt5TradingChart({ connectionId, symbol, timeframe, count = 200 }: Props) {
+  const chartContainerRef = useRef<HTMLDivElement>(null);
+  const [chartWidth, setChartWidth] = useState(900);
   const [candles, setCandles] = useState<Candle[]>([]);
   const [tick, setTick] = useState<Tick | null>(null);
   const [state, setState] = useState<"loading" | "ready" | "empty" | "error">("loading");
   const [message, setMessage] = useState("");
+
+  // Re-measure the chart itself so orientation changes and responsive parent
+  // layouts always leave room for the complete right-hand price scale.
+  useEffect(() => {
+    const element = chartContainerRef.current;
+    if (!element) return;
+
+    const resize = () => setChartWidth(Math.max(320, Math.round(element.clientWidth)));
+    resize();
+    const observer = new ResizeObserver(resize);
+    observer.observe(element);
+    window.addEventListener("orientationchange", resize);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("orientationchange", resize);
+    };
+  }, []);
 
   // Reload immediately when the connection, pair, timeframe, or candle count changes.
   // Then refresh the active candle history so the chart reflects live market movement.
@@ -137,18 +156,31 @@ export default function Mt5TradingChart({ connectionId, symbol, timeframe, count
     };
   }, [connectionId, symbol]);
 
-  const points = useMemo(() => {
-    if (!candles.length) return [];
-    const width = 900, height = 360, pad = 24;
+  const chart = useMemo(() => {
+    if (!candles.length) return null;
+    const height = 360;
+    const priceScaleWidth = Math.min(120, Math.max(96, chartWidth * 0.24));
+    const plotWidth = Math.max(220, chartWidth - priceScaleWidth);
+    const pad = 24;
     const low = Math.min(...candles.map(c => c.low));
     const high = Math.max(...candles.map(c => c.high));
     const range = high - low || 1;
-    return candles.map((c, index) => {
-      const x = pad + (index / Math.max(candles.length - 1, 1)) * (width - pad * 2);
-      const y = (value: number) => height - pad - ((value - low) / range) * (height - pad * 2);
+    const decimals = Math.min(8, Math.max(0, ...candles.map(c => {
+      const text = String(c.close);
+      return text.includes(".") ? text.length - text.indexOf(".") - 1 : 0;
+    })));
+    const formatPrice = (value: number) => value.toFixed(decimals);
+    const y = (value: number) => height - pad - ((value - low) / range) * (height - pad * 2);
+    const ticks = Array.from({ length: 7 }, (_, index) => {
+      const value = high - (range * index) / 6;
+      return { value, y: y(value), label: formatPrice(value) };
+    });
+    const points = candles.map((c, index) => {
+      const x = pad + (index / Math.max(candles.length - 1, 1)) * (plotWidth - pad * 2);
       return { x, open: y(c.open), close: y(c.close), high: y(c.high), low: y(c.low), rising: c.close >= c.open };
     });
-  }, [candles]);
+    return { height, low, high, plotWidth, priceScaleWidth, ticks, points };
+  }, [candles, chartWidth]);
 
   if (state === "loading") return <div className={styles.chartState}>Loading {symbol} {timeframe} market data…</div>;
   if (state === "error") return <div className={`${styles.chartState} ${styles.chartError}`}>{message}</div>;
@@ -160,12 +192,23 @@ export default function Mt5TradingChart({ connectionId, symbol, timeframe, count
       {tick ? <span>Bid {tick.bid} · Ask {tick.ask}</span> : <span>Waiting for {symbol} live tick…</span>}
     </div>
     {message && <p role="status">{message}</p>}
-    <svg className={styles.chart} viewBox="0 0 900 360" role="img" aria-label={`${symbol} ${timeframe} candlestick chart`}>
-      {points.map((point, index) => <g key={`${symbol}-${timeframe}-${candles[index].time}`}>
+    <div ref={chartContainerRef} className={styles.chartContainer}>
+      <svg className={styles.chart} viewBox={`0 0 ${chart ? chart.plotWidth + chart.priceScaleWidth : chartWidth} ${chart ? chart.height : 360}`} role="img" aria-label={`${symbol} ${timeframe} candlestick chart`}>
+      {chart && <>
+        <g className={styles.priceGrid} aria-hidden="true">
+          {chart.ticks.map(tick => <line key={`grid-${tick.label}`} x1="0" x2={chart.plotWidth} y1={tick.y} y2={tick.y} />)}
+        </g>
+        <g className={styles.priceScale} aria-label="Price scale">
+          <line x1={chart.plotWidth} x2={chart.plotWidth} y1="0" y2={chart.height} />
+          {chart.ticks.map(tick => <text key={`label-${tick.label}`} x={chart.plotWidth + chart.priceScaleWidth - 8} y={tick.y + 4} textAnchor="end">{tick.label}</text>)}
+        </g>
+      </>}
+      {chart?.points.map((point, index) => <g key={`${symbol}-${timeframe}-${candles[index].time}`}>
         <line x1={point.x} x2={point.x} y1={point.high} y2={point.low} stroke={point.rising ? "#16a34a" : "#dc2626"} />
         <rect x={point.x - 2} y={Math.min(point.open, point.close)} width="4" height={Math.max(Math.abs(point.close - point.open), 1)} fill={point.rising ? "#16a34a" : "#dc2626"} />
       </g>)}
-    </svg>
+      </svg>
+    </div>
     <p>Last candle: {candles[candles.length - 1]?.time ?? "—"} · Auto-refreshes every 10 seconds</p>
   </section>;
 }
