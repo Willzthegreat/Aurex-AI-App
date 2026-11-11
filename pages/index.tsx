@@ -110,6 +110,11 @@ type SymbolsResponse = {
   symbols: BrokerSymbol[];
 };
 
+type ReadinessCheck = {
+  ok: boolean;
+  message: string;
+};
+
 const DEFAULT_SYMBOL = "XAUUSDm";
 
 const TIMEFRAMES = [
@@ -145,27 +150,46 @@ export default function Home() {
   const [orderVolume, setOrderVolume] = useState("0.01");
   const [stopLoss, setStopLoss] = useState("");
   const [takeProfit, setTakeProfit] = useState("");
-  const [executionStatus, setExecutionStatus] = useState("DISCONNECTED");
+  const [readinessStatus, setReadinessStatus] = useState("DISCONNECTED");
+  const [readinessMessage, setReadinessMessage] = useState("");
+  const [readinessChecks, setReadinessChecks] = useState<Record<string, ReadinessCheck>>({});
+  const [executionStatus, setExecutionStatus] = useState("NOT SUBMITTED");
   const [executionMessage, setExecutionMessage] = useState("");
   const [submittingOrder, setSubmittingOrder] = useState(false);
 
   useEffect(() => {
     if (!connectionId || !user) {
-      setExecutionStatus("DISCONNECTED");
+      setReadinessStatus("DISCONNECTED");
+      setReadinessChecks({});
+      setReadinessMessage("Select a connected MT5 account.");
+      return;
+    }
+    if (!symbol) {
+      setReadinessStatus("SYMBOL_REQUIRED");
+      setReadinessChecks({});
+      setReadinessMessage("Select an exact broker symbol.");
       return;
     }
     let cancelled = false;
-    setExecutionStatus("CONNECTING");
-    fetch(`/api/mt5/connections/${encodeURIComponent(connectionId)}/execution-readiness?mode=${executionMode}`, { credentials: "same-origin" })
+    setReadinessStatus("CHECKING");
+    const query = new URLSearchParams({ mode: executionMode, symbol, side: orderSide });
+    fetch(`/api/mt5/connections/${encodeURIComponent(connectionId)}/execution-readiness?${query.toString()}`, { credentials: "same-origin", cache: "no-store" })
       .then(async response => response.json().catch(() => ({})))
       .then(payload => {
         if (cancelled) return;
-        setExecutionStatus(String(payload.status || "DISCONNECTED"));
-        setExecutionMessage(payload.error || "");
+        setReadinessStatus(String(payload.status || "UNKNOWN"));
+        setReadinessMessage(String(payload.message || payload.error || "Readiness response received."));
+        setReadinessChecks(payload.checks && typeof payload.checks === "object" ? payload.checks : {});
       })
-      .catch(() => { if (!cancelled) setExecutionStatus("DISCONNECTED"); });
+      .catch(() => {
+        if (!cancelled) {
+          setReadinessStatus("CONNECTOR_UNAVAILABLE");
+          setReadinessMessage("Unable to retrieve MT5 automation permissions.");
+          setReadinessChecks({});
+        }
+      });
     return () => { cancelled = true; };
-  }, [connectionId, executionMode, user]);
+  }, [connectionId, executionMode, orderSide, symbol, user]);
 
   async function submitBrokerOrder() {
     if (!connectionId || !symbol || executionMode !== "DEMO") return;
@@ -548,18 +572,27 @@ export default function Home() {
 
           {symbolError && <p role="alert">{symbolError}</p>}
 
-          <section style={{ border: "1px solid #d8dee9", borderRadius: 8, padding: 16, marginBottom: 20 }} aria-label="Broker order execution">
-            <h2 style={{ marginTop: 0 }}>Broker execution</h2>
-            <p aria-live="polite">Status: <strong>{executionStatus}</strong>{executionMessage ? ` — ${executionMessage}` : ""}</p>
+          <section style={{ border: "1px solid #d8dee9", borderRadius: 8, padding: 16, marginBottom: 20 }} aria-label="Broker automation control">
+            <h2 style={{ marginTop: 0 }}>Broker Automation Control</h2>
+            <p aria-live="polite">Readiness: <strong>{readinessStatus}</strong> — {readinessMessage}</p>
+            <ul style={{ paddingLeft: 20, marginTop: 8 }}>
+              {Object.entries(readinessChecks).map(([key, check]) => (
+                <li key={key} style={{ marginBottom: 6 }}>
+                  <strong>{key.replaceAll("_", " ")}:</strong> {check.ok ? "PASS" : "BLOCKED"} — {check.message}
+                </li>
+              ))}
+            </ul>
+            <p aria-live="polite">Last order: <strong>{executionStatus}</strong>{executionMessage ? ` — ${executionMessage}` : ""}</p>
             <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "end" }}>
               <label>Mode <select value={executionMode} onChange={event => setExecutionMode(event.target.value as "DEMO" | "LIVE")}><option value="DEMO">DEMO</option><option value="LIVE">LIVE</option></select></label>
               <label>Direction <select value={orderSide} onChange={event => setOrderSide(event.target.value as "BUY" | "SELL")}><option value="BUY">BUY</option><option value="SELL">SELL</option></select></label>
               <label>Volume <input inputMode="decimal" value={orderVolume} onChange={event => setOrderVolume(event.target.value)} /></label>
               <label>Stop-loss <input inputMode="decimal" value={stopLoss} onChange={event => setStopLoss(event.target.value)} placeholder="Optional" /></label>
               <label>Take-profit <input inputMode="decimal" value={takeProfit} onChange={event => setTakeProfit(event.target.value)} placeholder="Optional" /></label>
-              <button type="button" onClick={() => void submitBrokerOrder()} disabled={submittingOrder || executionMode !== "DEMO" || executionStatus !== "DEMO_READY" || !symbol}>{submittingOrder ? "Executing…" : "Review and submit DEMO order"}</button>
+              <button type="button" onClick={() => void submitBrokerOrder()} disabled={submittingOrder || executionMode !== "DEMO" || readinessStatus !== "DEMO_READY" || !symbol}>{submittingOrder ? "Executing…" : "Review and submit DEMO order"}</button>
             </div>
-            {executionMode === "LIVE" && <p>LIVE execution is disabled by server policy until independently authorized.</p>}
+            {executionMode === "LIVE" && <p>LIVE execution remains locked. Readiness checks do not authorize or unlock live orders.</p>}
+            <p style={{ fontSize: 13 }}>A READY status confirms permissions only. It does not prove that an order has been accepted or filled by the broker.</p>
             <p style={{ fontSize: 13 }}>Exact selected symbol: <code>{symbol || "none"}</code>. Orders are sent only to the selected managed MT5 connection.</p>
           </section>
 
