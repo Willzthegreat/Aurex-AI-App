@@ -28,7 +28,7 @@ class ExecutionConnector:
 
     def order_spec(self, cid, symbol):
         return {"symbol": symbol, "available": True, "bid": 100.0, "ask": 100.2,
-                "point": 0.01, "trade_mode": self.symbol_trade_mode, "volume_min": 0.01,
+                "point": 0.01, "trade_mode": self.symbol_trade_mode, "order_mode": 127, "volume_min": 0.01,
                 "volume_max": 10.0, "volume_step": 0.01, "trade_stops_level": 10}
 
     def submit_order(self, cid, body):
