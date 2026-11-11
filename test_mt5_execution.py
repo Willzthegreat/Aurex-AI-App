@@ -38,6 +38,11 @@ class ExecutionConnector:
 
 
 def _client(tmp_path: Path, monkeypatch):
+    ExecutionConnector.calls = []
+    ExecutionConnector.terminal_algo_disabled = False
+    ExecutionConnector.account_trade_allowed = True
+    ExecutionConnector.account_trade_expert = True
+    ExecutionConnector.symbol_trade_mode = 4
     monkeypatch.setenv("AUREX_ENABLE_DEMO_ORDER_EXECUTION", "true")
     monkeypatch.setenv("AUREX_EXECUTION_DB", str(tmp_path / "execution.sqlite3"))
     monkeypatch.setenv("AUREX_AUTH_COOKIE_SECURE", "false")
