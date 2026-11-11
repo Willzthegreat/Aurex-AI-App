@@ -354,9 +354,12 @@ def create_app(store: ConnectionStore | None = None, client_factory: Callable[[]
         steps = round((body.volume - minimum) / step)
         if not math.isclose(minimum + steps * step, body.volume, rel_tol=0, abs_tol=max(step * 1e-6, 1e-9)):
             raise HTTPException(422, "Order volume does not match the broker volume step")
-        trade_mode = int(spec.get("trade_mode", 4))
+        trade_mode = int(spec.get("trade_mode", 0))
         if trade_mode in (0, 3) or (body.side == "BUY" and trade_mode == 2) or (body.side == "SELL" and trade_mode == 1):
             raise HTTPException(409, "The selected symbol does not permit this order direction")
+        order_mode = spec.get("order_mode")
+        if not isinstance(order_mode, int) or not (order_mode & 1):
+            raise HTTPException(409, "The selected symbol does not advertise market-order permission")
         point = float(spec.get("point", 0))
         stops = float(spec.get("trade_stops_level", 0)) * point
         price = float(ask if body.side == "BUY" else bid)
@@ -625,6 +628,11 @@ def create_app(store: ConnectionStore | None = None, client_factory: Callable[[]
             checks["symbol_direction"] = {"ok": direction_ok, "message": f"{symbol} permits {side} orders." if direction_ok else f"Broker symbol permissions do not permit {side} orders on {symbol}."}
             if not direction_ok:
                 return response("SYMBOL_DIRECTION_BLOCKED", checks["symbol_direction"]["message"])
+
+            market_orders_ok = isinstance(spec.get("order_mode"), int) and bool(spec.get("order_mode") & 1)
+            checks["symbol_market_orders"] = {"ok": market_orders_ok, "message": f"{symbol} permits market orders." if market_orders_ok else f"{symbol} does not permit market orders or the broker permission could not be verified."}
+            if not market_orders_ok:
+                return response("SYMBOL_ORDER_TYPE_BLOCKED", checks["symbol_market_orders"]["message"])
 
             return response("DEMO_READY" if mode == "DEMO" else "LIVE_READY", "All account, terminal, and selected-symbol permissions passed. This is a readiness check, not proof of a successful broker order.")
         except ConnectorError as exc:
