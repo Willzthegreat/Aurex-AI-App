@@ -1361,7 +1361,7 @@ def session_worker(connection_id: str) -> None:
             if getattr(terminal, "trade_allowed", None) is not True:
                 raise HTTPException(status_code=409, detail="MT5 terminal trading permission is disabled or unavailable (terminal trade_allowed must be true).")
             if getattr(terminal, "tradeapi_disabled", None) is not False:
-                raise HTTPException(status_code=409, detail="MT5 Algo Trading is disabled or its state is unavailable. Enable the Algo Trading toolbar control and allow algorithmic trading in Tools > Options > Expert Advisors.")
+                raise HTTPException(status_code=409, detail="MT5 Algo Trading is disabled or its state is unavailable. Enable the MT5 Algo Trading toolbar control and, in Tools > Options > Expert Advisors, clear 'Disable automated trading via external Python API'.")
         validate_symbol(body.symbol)
         info = mt5.symbol_info(body.symbol)
         tick = mt5.symbol_info_tick(body.symbol)
