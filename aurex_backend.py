@@ -331,8 +331,17 @@ def create_app(store: ConnectionStore | None = None, client_factory: Callable[[]
         expected_mode = 0 if body.mode == "DEMO" else 2
         if account.get("trade_mode") != expected_mode:
             raise HTTPException(409, "The connected MT5 account mode does not match the requested mode")
-        if account.get("trade_allowed") is False:
-            raise HTTPException(409, "Trading is disabled on the connected MT5 account")
+        if account.get("trade_allowed") is not True:
+            raise HTTPException(409, "MT5 account trading permission is disabled or could not be verified")
+        if account.get("trade_expert") is not True:
+            raise HTTPException(409, "Automated Expert Advisor trading is disabled for this MT5 account")
+        terminal = account_response.get("terminal", {}) if isinstance(account_response, dict) else {}
+        if not isinstance(terminal, dict) or terminal.get("connected") is not True:
+            raise HTTPException(409, "MT5 terminal connection status is unavailable or disconnected")
+        if terminal.get("trade_allowed") is not True:
+            raise HTTPException(409, "MT5 terminal trading permission is disabled or could not be verified")
+        if terminal.get("tradeapi_disabled") is not False:
+            raise HTTPException(409, "MT5 Algo Trading is disabled or its permission could not be verified. Enable the MT5 Algo Trading toolbar control and, in Tools > Options > Expert Advisors, clear 'Disable automated trading via external Python API'.")
         spec = client.order_spec(body.connection_id, body.symbol)
         if spec.get("symbol") != body.symbol or spec.get("available") is False:
             raise HTTPException(422, "The exact selected symbol is unavailable on this account")
@@ -345,9 +354,12 @@ def create_app(store: ConnectionStore | None = None, client_factory: Callable[[]
         steps = round((body.volume - minimum) / step)
         if not math.isclose(minimum + steps * step, body.volume, rel_tol=0, abs_tol=max(step * 1e-6, 1e-9)):
             raise HTTPException(422, "Order volume does not match the broker volume step")
-        trade_mode = int(spec.get("trade_mode", 4))
+        trade_mode = int(spec.get("trade_mode", 0))
         if trade_mode in (0, 3) or (body.side == "BUY" and trade_mode == 2) or (body.side == "SELL" and trade_mode == 1):
             raise HTTPException(409, "The selected symbol does not permit this order direction")
+        order_mode = spec.get("order_mode")
+        if not isinstance(order_mode, int) or not (order_mode & 1):
+            raise HTTPException(409, "The selected symbol does not advertise market-order permission")
         point = float(spec.get("point", 0))
         stops = float(spec.get("trade_stops_level", 0)) * point
         price = float(ask if body.side == "BUY" else bid)
@@ -525,24 +537,106 @@ def create_app(store: ConnectionStore | None = None, client_factory: Callable[[]
         return {"symbol": symbol, "timeframe": timeframe, "count": len(unique), "candles": list(unique.values())}
 
     @app.get("/api/mt5/connections/{cid}/execution-readiness")
-    def execution_readiness(cid: str, mode: Literal["DEMO", "LIVE"] = "DEMO", user_id: str = Depends(current_user)):
+    def execution_readiness(
+        cid: str,
+        mode: Literal["DEMO", "LIVE"] = "DEMO",
+        symbol: str | None = Query(default=None, min_length=1, max_length=32, pattern=r"^[A-Za-z0-9._-]+$"),
+        side: Literal["BUY", "SELL"] | None = None,
+        user_id: str = Depends(current_user),
+    ):
         owned(db, cid, user_id)
-        if not accounts.has_permission(user_id, "trading.orders.execute"):
-            return {"status": "PERMISSION_REQUIRED", "mode": mode}
-        if not execution_flag(mode) or (mode == "LIVE" and os.getenv("AUREX_LIVE_EXECUTION_AUTHORIZED", "false").casefold() != "true"):
-            return {"status": "LIVE_DISABLED" if mode == "LIVE" else "DEMO_DISABLED", "mode": mode}
+        checks: dict[str, dict[str, Any]] = {}
+
+        def response(status_value: str, message: str):
+            return {
+                "status": status_value, "mode": mode, "symbol": symbol, "side": side,
+                "ready": status_value == ("DEMO_READY" if mode == "DEMO" else "LIVE_READY"),
+                "checks": checks, "message": message,
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+        permission_ok = accounts.has_permission(user_id, "trading.orders.execute")
+        checks["user_execution_permission"] = {"ok": permission_ok, "message": "Execution permission granted." if permission_ok else "Your account does not have trading.orders.execute permission."}
+        if not permission_ok:
+            return response("PERMISSION_REQUIRED", checks["user_execution_permission"]["message"])
+
+        policy_ok = execution_flag(mode)
+        live_authorized = mode != "LIVE" or os.getenv("AUREX_LIVE_EXECUTION_AUTHORIZED", "false").casefold() == "true"
+        checks["server_execution_policy"] = {"ok": policy_ok and live_authorized, "message": "Server execution policy permits this mode." if policy_ok and live_authorized else f"{mode} execution is disabled by server policy or has not received explicit owner authorization."}
+        if not policy_ok or not live_authorized:
+            return response("LIVE_DISABLED" if mode == "LIVE" else "DEMO_DISABLED", checks["server_execution_policy"]["message"])
+
         try:
-            result = client_factory().status(cid)
-            if normalize_status(result.get("status")) != "CONNECTED":
-                return {"status": normalize_status(result.get("status")), "mode": mode}
-            account_response = client_factory().account(cid)
-            account = account_response.get("account", account_response) if isinstance(account_response, dict) else {}
+            client = client_factory()
+            connection = client.status(cid)
+            connected = isinstance(connection, dict) and normalize_status(connection.get("status")) == "CONNECTED"
+            checks["mt5_connection"] = {"ok": connected, "message": "Managed MT5 session is connected." if connected else "Managed MT5 session is not connected."}
+            if not connected:
+                connection_status = normalize_status(connection.get("status")) if isinstance(connection, dict) else "DISCONNECTED"
+                return response(connection_status, checks["mt5_connection"]["message"])
+
+            account_response = client.account(cid)
+            account = account_response.get("account", {}) if isinstance(account_response, dict) else {}
+            terminal = account_response.get("terminal", {}) if isinstance(account_response, dict) else {}
+            if not isinstance(account, dict): account = {}
+            if not isinstance(terminal, dict): terminal = {}
+
             expected_mode = 0 if mode == "DEMO" else 2
-            if account.get("trade_mode") != expected_mode or account.get("trade_allowed") is False:
-                return {"status": "ACCOUNT_MODE_MISMATCH", "mode": mode}
-            return {"status": "DEMO_READY" if mode == "DEMO" else "LIVE_READY", "mode": mode}
+            mode_ok = account.get("trade_mode") == expected_mode
+            checks["account_mode"] = {"ok": mode_ok, "message": f"MT5 account mode matches {mode}." if mode_ok else f"Selected MT5 account is not a {mode} account."}
+            if not mode_ok:
+                return response("ACCOUNT_MODE_MISMATCH", checks["account_mode"]["message"])
+
+            account_trade_ok = account.get("trade_allowed") is True
+            checks["account_trade_permission"] = {"ok": account_trade_ok, "message": "Broker account trading is allowed." if account_trade_ok else "Broker account trade permission is disabled or could not be verified (trade_allowed must be true)."}
+            if not account_trade_ok:
+                return response("ACCOUNT_TRADE_DISABLED", checks["account_trade_permission"]["message"])
+
+            expert_ok = account.get("trade_expert") is True
+            checks["expert_trading_permission"] = {"ok": expert_ok, "message": "Automated Expert Advisor trading is allowed." if expert_ok else "Automated Expert Advisor permission is disabled or unavailable (trade_expert must be true)."}
+            if not expert_ok:
+                return response("EXPERT_TRADING_DISABLED", checks["expert_trading_permission"]["message"])
+
+            terminal_connected = terminal.get("connected") is True
+            checks["terminal_connection"] = {"ok": terminal_connected, "message": "MT5 terminal reports connected." if terminal_connected else "MT5 terminal connection is unavailable or disconnected."}
+            if not terminal_connected:
+                return response("TERMINAL_DISCONNECTED", checks["terminal_connection"]["message"])
+
+            terminal_trade_ok = terminal.get("trade_allowed") is True
+            checks["terminal_trade_permission"] = {"ok": terminal_trade_ok, "message": "MT5 terminal trading permission is enabled." if terminal_trade_ok else "MT5 terminal trading permission is disabled or unknown (terminal trade_allowed must be true)."}
+            if not terminal_trade_ok:
+                return response("TERMINAL_TRADING_DISABLED", checks["terminal_trade_permission"]["message"])
+
+            algo_allowed = terminal.get("tradeapi_disabled") is False
+            checks["terminal_algo_trading"] = {"ok": algo_allowed, "message": "MT5 terminal Algo Trading is enabled." if algo_allowed else "MT5 Algo Trading is disabled or its state is unknown. Enable the Algo Trading toolbar control and allow algorithmic trading in Tools > Options > Expert Advisors."}
+            if not algo_allowed:
+                return response("ALGO_TRADING_DISABLED", checks["terminal_algo_trading"]["message"])
+
+            if not symbol:
+                return response("SYMBOL_REQUIRED", "Account and terminal permissions pass. Select an exact broker symbol and direction to complete readiness verification.")
+            if not side:
+                return response("SIDE_REQUIRED", "Select BUY or SELL to verify that the broker permits the requested symbol direction.")
+
+            spec = client.order_spec(cid, symbol)
+            symbol_ok = isinstance(spec, dict) and spec.get("symbol") == symbol and spec.get("available") is True
+            checks["symbol_available"] = {"ok": symbol_ok, "message": f"{symbol} is available on this MT5 account." if symbol_ok else f"{symbol} is unavailable or could not be verified on this MT5 account."}
+            if not symbol_ok:
+                return response("SYMBOL_UNAVAILABLE", checks["symbol_available"]["message"])
+
+            trade_mode = spec.get("trade_mode")
+            direction_ok = isinstance(trade_mode, int) and trade_mode not in (0, 3) and not (side == "BUY" and trade_mode == 2) and not (side == "SELL" and trade_mode == 1)
+            checks["symbol_direction"] = {"ok": direction_ok, "message": f"{symbol} permits {side} orders." if direction_ok else f"Broker symbol permissions do not permit {side} orders on {symbol}."}
+            if not direction_ok:
+                return response("SYMBOL_DIRECTION_BLOCKED", checks["symbol_direction"]["message"])
+
+            market_orders_ok = isinstance(spec.get("order_mode"), int) and bool(spec.get("order_mode") & 1)
+            checks["symbol_market_orders"] = {"ok": market_orders_ok, "message": f"{symbol} permits market orders." if market_orders_ok else f"{symbol} does not permit market orders or the broker permission could not be verified."}
+            if not market_orders_ok:
+                return response("SYMBOL_ORDER_TYPE_BLOCKED", checks["symbol_market_orders"]["message"])
+
+            return response("DEMO_READY" if mode == "DEMO" else "LIVE_READY", "All account, terminal, and selected-symbol permissions passed. This is a readiness check, not proof of a successful broker order.")
         except ConnectorError as exc:
-            return {"status": "DISCONNECTED", "mode": mode, "error": exc.message}
+            return response("CONNECTOR_UNAVAILABLE", exc.message)
 
     @app.post("/api/mt5/orders", status_code=202)
     def submit_order(body: OrderInput, user_id: str = Depends(current_user)):
