@@ -1415,6 +1415,10 @@ def session_worker(connection_id: str) -> None:
             raise HTTPException(status_code=422, detail="Stop-loss violates broker stop-level restrictions.")
         if body.take_profit is not None and ((body.side == "BUY" and body.take_profit <= price + minimum_distance) or (body.side == "SELL" and body.take_profit >= price - minimum_distance)):
             raise HTTPException(status_code=422, detail="Take-profit violates broker stop-level restrictions.")
+        order_mode = int(getattr(info, "order_mode", 0))
+        market_order_flag = int(getattr(mt5, "SYMBOL_ORDER_MARKET", 1))
+        if not (order_mode & market_order_flag):
+            raise HTTPException(status_code=409, detail="Broker symbol settings do not permit market orders.")
         order_type = mt5.ORDER_TYPE_BUY if body.side == "BUY" else mt5.ORDER_TYPE_SELL
         request = {"action": mt5.TRADE_ACTION_DEAL, "symbol": body.symbol, "volume": body.volume, "type": order_type,
                    "price": price, "sl": body.stop_loss or 0.0, "tp": body.take_profit or 0.0,
