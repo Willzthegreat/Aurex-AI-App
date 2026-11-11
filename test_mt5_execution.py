@@ -12,6 +12,7 @@ class ExecutionConnector:
     terminal_algo_disabled = False
     account_trade_allowed = True
     account_trade_expert = True
+    symbol_trade_mode = 4
 
     def status(self, cid):
         return {"status": "CONNECTED"}
@@ -27,7 +28,7 @@ class ExecutionConnector:
 
     def order_spec(self, cid, symbol):
         return {"symbol": symbol, "available": True, "bid": 100.0, "ask": 100.2,
-                "point": 0.01, "trade_mode": 4, "volume_min": 0.01,
+                "point": 0.01, "trade_mode": self.symbol_trade_mode, "volume_min": 0.01,
                 "volume_max": 10.0, "volume_step": 0.01, "trade_stops_level": 10}
 
     def submit_order(self, cid, body):
@@ -126,6 +127,31 @@ def test_readiness_does_not_claim_ready_without_symbol_and_side(tmp_path, monkey
     assert response.status_code == 200
     assert response.json()["status"] == "SYMBOL_REQUIRED"
     assert response.json()["ready"] is False
+
+
+
+def test_order_submission_is_blocked_when_terminal_algo_trading_is_disabled(tmp_path, monkeypatch):
+    client, _ = _client(tmp_path, monkeypatch)
+    ExecutionConnector.terminal_algo_disabled = True
+    try:
+        response = client.post("/api/mt5/orders", json=_payload(key="blocked-algo-123456789"))
+        assert response.status_code == 409
+        assert "Algo Trading is disabled" in response.text
+        assert ExecutionConnector.calls == []
+    finally:
+        ExecutionConnector.terminal_algo_disabled = False
+
+
+def test_readiness_blocks_symbol_direction_not_permitted_by_broker(tmp_path, monkeypatch):
+    client, _ = _client(tmp_path, monkeypatch)
+    ExecutionConnector.symbol_trade_mode = 2  # short-only
+    try:
+        response = client.get("/api/mt5/connections/11111111-1111-1111-1111-111111111111/execution-readiness?mode=DEMO&symbol=XAUUSDm&side=BUY")
+        assert response.status_code == 200
+        assert response.json()["status"] == "SYMBOL_DIRECTION_BLOCKED"
+        assert response.json()["ready"] is False
+    finally:
+        ExecutionConnector.symbol_trade_mode = 4
 
 
 def test_invalid_symbol_is_rejected_before_worker_submission(tmp_path, monkeypatch):
