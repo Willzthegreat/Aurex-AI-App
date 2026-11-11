@@ -1291,8 +1291,14 @@ def session_worker(connection_id: str) -> None:
         allowed = ("login", "trade_mode", "leverage", "limit_orders", "trade_allowed", "trade_expert",
                    "balance", "credit", "profit", "equity", "margin", "margin_free", "margin_level",
                    "margin_so_call", "margin_so_so", "name", "server", "currency", "company")
+        terminal_allowed = ("connected", "trade_allowed", "tradeapi_disabled", "build", "name", "company", "path")
         values = account._asdict()
-        return {"account": {key: values.get(key) for key in allowed}, "checked_at": datetime.now(timezone.utc).isoformat()}
+        terminal_values = terminal._asdict()
+        return {
+            "account": {key: values.get(key) for key in allowed},
+            "terminal": {key: terminal_values.get(key) for key in terminal_allowed},
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }
 
     @session_app.get("/internal/positions")
     def internal_positions(_: bool = Depends(authorized_internal)):
@@ -1337,18 +1343,25 @@ def session_worker(connection_id: str) -> None:
                 "executed_volume": values.get("volume", 0) if isinstance(values, dict) else 0,
                 "checked_at": now()}
 
-    def account_and_symbol(body: ManagedOrder | ManagedPosition):
+    def account_and_symbol(body: ManagedOrder | ManagedPosition, require_execution: bool = True):
         terminal = mt5.terminal_info()
         account = mt5.account_info()
-        if terminal is None or not terminal.connected or account is None:
+        if terminal is None or not bool(getattr(terminal, "connected", False)) or account is None:
             raise HTTPException(status_code=503, detail="MT5 terminal is not connected.")
         expected = 0 if body.mode == "DEMO" else 2
         if int(getattr(account, "trade_mode", -1)) != expected:
             raise HTTPException(status_code=409, detail="Connected MT5 account mode does not match the requested mode.")
-        if not execution_enabled(body.mode):
-            raise HTTPException(status_code=423, detail=f"{body.mode} broker execution is disabled by server policy.")
-        if not bool(getattr(account, "trade_allowed", False)) or not bool(getattr(account, "trade_expert", False)):
-            raise HTTPException(status_code=409, detail="Broker trading permissions are disabled.")
+        if require_execution:
+            if not execution_enabled(body.mode):
+                raise HTTPException(status_code=423, detail=f"{body.mode} broker execution is disabled by server policy.")
+            if getattr(account, "trade_allowed", None) is not True:
+                raise HTTPException(status_code=409, detail="Broker account trading permission is disabled or unavailable (trade_allowed must be true).")
+            if getattr(account, "trade_expert", None) is not True:
+                raise HTTPException(status_code=409, detail="Automated Expert Advisor trading is disabled or unavailable for this MT5 account (trade_expert must be true).")
+            if getattr(terminal, "trade_allowed", None) is not True:
+                raise HTTPException(status_code=409, detail="MT5 terminal trading permission is disabled or unavailable (terminal trade_allowed must be true).")
+            if getattr(terminal, "tradeapi_disabled", None) is not False:
+                raise HTTPException(status_code=409, detail="MT5 Algo Trading is disabled or its state is unavailable. Enable the Algo Trading toolbar control and allow algorithmic trading in Tools > Options > Expert Advisors.")
         validate_symbol(body.symbol)
         info = mt5.symbol_info(body.symbol)
         tick = mt5.symbol_info_tick(body.symbol)
@@ -1376,11 +1389,12 @@ def session_worker(connection_id: str) -> None:
     @session_app.get("/internal/order-spec/{symbol}")
     def internal_order_spec(symbol: str, _: bool = Depends(authorized_internal)):
         validate_symbol(symbol)
-        account, info, tick = account_and_symbol(ManagedPosition(request_id=str(uuid4()), mode="DEMO", ticket=1, symbol=symbol))
+        account, info, tick = account_and_symbol(ManagedPosition(request_id=str(uuid4()), mode="DEMO", ticket=1, symbol=symbol), require_execution=False)
         values = info._asdict()
         return {"symbol": symbol, "available": True, "bid": float(tick.bid), "ask": float(tick.ask),
                 "point": float(values.get("point", 0)), "digits": int(values.get("digits", 0)),
-                "trade_mode": int(values.get("trade_mode", 0)), "filling_mode": int(values.get("filling_mode", 0)),
+                "trade_mode": int(values.get("trade_mode", 0)), "order_mode": int(values.get("order_mode", 0)),
+                "filling_mode": int(values.get("filling_mode", 0)),
                 "volume_min": float(values.get("volume_min", 0)), "volume_max": float(values.get("volume_max", 0)),
                 "volume_step": float(values.get("volume_step", 0)), "trade_stops_level": int(values.get("trade_stops_level", 0)),
                 "trade_freeze_level": int(values.get("trade_freeze_level", 0)), "trade_tick_size": float(values.get("trade_tick_size", 0)),
