@@ -1348,10 +1348,10 @@ def session_worker(connection_id: str) -> None:
         account = mt5.account_info()
         if terminal is None or not bool(getattr(terminal, "connected", False)) or account is None:
             raise HTTPException(status_code=503, detail="MT5 terminal is not connected.")
-        expected = 0 if body.mode == "DEMO" else 2
-        if int(getattr(account, "trade_mode", -1)) != expected:
-            raise HTTPException(status_code=409, detail="Connected MT5 account mode does not match the requested mode.")
         if require_execution:
+            expected = 0 if body.mode == "DEMO" else 2
+            if int(getattr(account, "trade_mode", -1)) != expected:
+                raise HTTPException(status_code=409, detail="Connected MT5 account mode does not match the requested mode.")
             if not execution_enabled(body.mode):
                 raise HTTPException(status_code=423, detail=f"{body.mode} broker execution is disabled by server policy.")
             if getattr(account, "trade_allowed", None) is not True:
