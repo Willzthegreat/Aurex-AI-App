@@ -341,7 +341,7 @@ def create_app(store: ConnectionStore | None = None, client_factory: Callable[[]
         if terminal.get("trade_allowed") is not True:
             raise HTTPException(409, "MT5 terminal trading permission is disabled or could not be verified")
         if terminal.get("tradeapi_disabled") is not False:
-            raise HTTPException(409, "MT5 Algo Trading is disabled or its permission could not be verified. Enable the Algo Trading toolbar control and allow algorithmic trading in Tools > Options > Expert Advisors.")
+            raise HTTPException(409, "MT5 Algo Trading is disabled or its permission could not be verified. Enable the MT5 Algo Trading toolbar control and, in Tools > Options > Expert Advisors, clear 'Disable automated trading via external Python API'.")
         spec = client.order_spec(body.connection_id, body.symbol)
         if spec.get("symbol") != body.symbol or spec.get("available") is False:
             raise HTTPException(422, "The exact selected symbol is unavailable on this account")
